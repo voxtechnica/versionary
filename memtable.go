@@ -320,14 +320,14 @@ func (table MemTable[T]) ReadEntities(ctx context.Context, entityIDs []string) [
 	return entities
 }
 
-// ReadEntitiesAsJson reads the current versions of the specified entities from the EntityRow as a JSON byte slice.
+// ReadEntitiesAsJSON reads the current versions of the specified entities from the EntityRow as a JSON byte slice.
 // If an entity does not exist, it will be omitted from the results.
-func (table MemTable[T]) ReadEntitiesAsJson(ctx context.Context, entityIDs []string) []byte {
+func (table MemTable[T]) ReadEntitiesAsJSON(ctx context.Context, entityIDs []string) []byte {
 	var entities bytes.Buffer
 	entities.WriteString("[")
 	var i int
 	for _, entityID := range entityIDs {
-		entity, err := table.ReadEntityAsJson(ctx, entityID)
+		entity, err := table.ReadEntityAsJSON(ctx, entityID)
 		if err == nil {
 			if i > 0 {
 				entities.WriteString(",")
@@ -343,42 +343,42 @@ func (table MemTable[T]) ReadEntitiesAsJson(ctx context.Context, entityIDs []str
 // ReadEntity reads the current version of the specified entity.
 func (table MemTable[T]) ReadEntity(ctx context.Context, entityID string) (T, error) {
 	var entity T
-	gzJson, err := table.ReadEntityAsCompressedJson(ctx, entityID)
+	gzJSON, err := table.ReadEntityAsCompressedJSON(ctx, entityID)
 	if err != nil {
 		return entity, err
 	}
-	err = FromCompressedJson(gzJson, &entity)
+	err = FromCompressedJSON(gzJSON, &entity)
 	if err != nil {
 		return entity, err
 	}
 	return entity, nil
 }
 
-// ReadEntityAsJson reads the current version of the specified entity as a JSON byte slice.
-func (table MemTable[T]) ReadEntityAsJson(ctx context.Context, entityID string) ([]byte, error) {
-	gzJson, err := table.ReadEntityAsCompressedJson(ctx, entityID)
+// ReadEntityAsJSON reads the current version of the specified entity as a JSON byte slice.
+func (table MemTable[T]) ReadEntityAsJSON(ctx context.Context, entityID string) ([]byte, error) {
+	gzJSON, err := table.ReadEntityAsCompressedJSON(ctx, entityID)
 	if err != nil {
 		return nil, err
 	}
-	return UncompressJson(gzJson)
+	return UncompressJSON(gzJSON)
 }
 
-// ReadEntityAsCompressedJson reads the current version of the specified entity, returning a compressed JSON byte slice.
-func (table MemTable[T]) ReadEntityAsCompressedJson(ctx context.Context, entityID string) ([]byte, error) {
+// ReadEntityAsCompressedJSON reads the current version of the specified entity, returning a compressed JSON byte slice.
+func (table MemTable[T]) ReadEntityAsCompressedJSON(ctx context.Context, entityID string) ([]byte, error) {
 	if table.EntityRow.JsonValue == nil {
 		return nil, errors.New("the EntityRow must contain compressed JSON values")
 	}
 	if entityID == "" {
 		return nil, errors.New("the entity ID must be provided")
 	}
-	versionId, err := table.ReadCurrentEntityVersionID(ctx, entityID)
+	versionID, err := table.ReadCurrentEntityVersionID(ctx, entityID)
 	if err != nil {
 		return nil, err
 	}
-	if versionId == "" {
+	if versionID == "" {
 		return nil, ErrNotFound
 	}
-	record, ok := table.Records.GetRecord(table.EntityRow.getRowPartKeyValue(entityID), versionId)
+	record, ok := table.Records.GetRecord(table.EntityRow.getRowPartKeyValue(entityID), versionID)
 	if !ok {
 		return nil, ErrNotFound
 	}
@@ -390,9 +390,9 @@ func (table MemTable[T]) ReadEntityVersion(ctx context.Context, entityID string,
 	return table.ReadEntityFromRow(ctx, table.EntityRow, entityID, versionID)
 }
 
-// ReadEntityVersionAsJson reads the specified version of the specified entity as a JSON byte slice.
-func (table MemTable[T]) ReadEntityVersionAsJson(ctx context.Context, entityID string, versionID string) ([]byte, error) {
-	return table.ReadEntityFromRowAsJson(ctx, table.EntityRow, entityID, versionID)
+// ReadEntityVersionAsJSON reads the specified version of the specified entity as a JSON byte slice.
+func (table MemTable[T]) ReadEntityVersionAsJSON(ctx context.Context, entityID string, versionID string) ([]byte, error) {
+	return table.ReadEntityFromRowAsJSON(ctx, table.EntityRow, entityID, versionID)
 }
 
 // ReadEntityVersions reads paginated versions of the specified entity.
@@ -400,9 +400,9 @@ func (table MemTable[T]) ReadEntityVersions(ctx context.Context, entityID string
 	return table.ReadEntitiesFromRow(ctx, table.EntityRow, entityID, reverse, limit, offset)
 }
 
-// ReadEntityVersionsAsJson reads paginated versions of the specified entity as a JSON byte slice.
-func (table MemTable[T]) ReadEntityVersionsAsJson(ctx context.Context, entityID string, reverse bool, limit int, offset string) ([]byte, error) {
-	return table.ReadEntitiesFromRowAsJson(ctx, table.EntityRow, entityID, reverse, limit, offset)
+// ReadEntityVersionsAsJSON reads paginated versions of the specified entity as a JSON byte slice.
+func (table MemTable[T]) ReadEntityVersionsAsJSON(ctx context.Context, entityID string, reverse bool, limit int, offset string) ([]byte, error) {
+	return table.ReadEntitiesFromRowAsJSON(ctx, table.EntityRow, entityID, reverse, limit, offset)
 }
 
 // ReadAllEntityVersions reads all versions of the specified entity.
@@ -411,37 +411,37 @@ func (table MemTable[T]) ReadAllEntityVersions(ctx context.Context, entityID str
 	return table.ReadAllEntitiesFromRow(ctx, table.EntityRow, entityID)
 }
 
-// ReadAllEntityVersionsAsJson reads all versions of the specified entity as a JSON byte slice.
+// ReadAllEntityVersionsAsJSON reads all versions of the specified entity as a JSON byte slice.
 // Note: this can return a very large number of versions! Use with caution.
-func (table MemTable[T]) ReadAllEntityVersionsAsJson(ctx context.Context, entityID string) ([]byte, error) {
-	return table.ReadAllEntitiesFromRowAsJson(ctx, table.EntityRow, entityID)
+func (table MemTable[T]) ReadAllEntityVersionsAsJSON(ctx context.Context, entityID string) ([]byte, error) {
+	return table.ReadAllEntitiesFromRowAsJSON(ctx, table.EntityRow, entityID)
 }
 
 // ReadEntityFromRow reads the specified entity from the specified row.
 func (table MemTable[T]) ReadEntityFromRow(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (T, error) {
 	var entity T
-	gzJson, err := table.ReadEntityFromRowAsCompressedJson(ctx, row, partKeyValue, sortKeyValue)
+	gzJSON, err := table.ReadEntityFromRowAsCompressedJSON(ctx, row, partKeyValue, sortKeyValue)
 	if err != nil {
 		return entity, err
 	}
-	err = FromCompressedJson(gzJson, &entity)
+	err = FromCompressedJSON(gzJSON, &entity)
 	if err != nil {
 		return entity, err
 	}
 	return entity, nil
 }
 
-// ReadEntityFromRowAsJson reads the specified entity from the specified row as JSON bytes.
-func (table MemTable[T]) ReadEntityFromRowAsJson(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) ([]byte, error) {
-	gzJson, err := table.ReadEntityFromRowAsCompressedJson(ctx, row, partKeyValue, sortKeyValue)
+// ReadEntityFromRowAsJSON reads the specified entity from the specified row as JSON bytes.
+func (table MemTable[T]) ReadEntityFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) ([]byte, error) {
+	gzJSON, err := table.ReadEntityFromRowAsCompressedJSON(ctx, row, partKeyValue, sortKeyValue)
 	if err != nil {
 		return nil, err
 	}
-	return UncompressJson(gzJson)
+	return UncompressJSON(gzJSON)
 }
 
-// ReadEntityFromRowAsCompressedJson reads the specified entity from the specified row as compressed JSON bytes.
-func (table MemTable[T]) ReadEntityFromRowAsCompressedJson(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) ([]byte, error) {
+// ReadEntityFromRowAsCompressedJSON reads the specified entity from the specified row as compressed JSON bytes.
+func (table MemTable[T]) ReadEntityFromRowAsCompressedJSON(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) ([]byte, error) {
 	if row.JsonValue == nil {
 		return nil, errors.New("row " + row.RowName + " must contain compressed JSON values")
 	}
@@ -471,8 +471,8 @@ func (table MemTable[T]) ReadEntitiesFromRow(ctx context.Context, row TableRow[T
 	return entities, nil
 }
 
-// ReadEntitiesFromRowAsJson reads paginated entities from the specified row, returning a JSON byte slice.
-func (table MemTable[T]) ReadEntitiesFromRowAsJson(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]byte, error) {
+// ReadEntitiesFromRowAsJSON reads paginated entities from the specified row, returning a JSON byte slice.
+func (table MemTable[T]) ReadEntitiesFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]byte, error) {
 	if row.JsonValue == nil {
 		return nil, errors.New("row " + row.RowName + " must contain compressed JSON values")
 	}
@@ -484,7 +484,7 @@ func (table MemTable[T]) ReadEntitiesFromRowAsJson(ctx context.Context, row Tabl
 	var buf bytes.Buffer
 	buf.WriteString("[")
 	for _, sortKeyValue := range sortKeyValues {
-		jsonBytes, err := table.ReadEntityFromRowAsJson(ctx, row, partKeyValue, sortKeyValue)
+		jsonBytes, err := table.ReadEntityFromRowAsJSON(ctx, row, partKeyValue, sortKeyValue)
 		if err != nil {
 			continue
 		}
@@ -518,9 +518,9 @@ func (table MemTable[T]) ReadAllEntitiesFromRow(ctx context.Context, row TableRo
 	return entities, nil
 }
 
-// ReadAllEntitiesFromRowAsJson reads all entities from the specified row as a JSON byte slice.
+// ReadAllEntitiesFromRowAsJSON reads all entities from the specified row as a JSON byte slice.
 // Note: this could be a lot of data! It should only be used for small collections.
-func (table MemTable[T]) ReadAllEntitiesFromRowAsJson(ctx context.Context, row TableRow[T], partKeyValue string) ([]byte, error) {
+func (table MemTable[T]) ReadAllEntitiesFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string) ([]byte, error) {
 	if row.JsonValue == nil {
 		return nil, errors.New("row " + row.RowName + " must contain compressed JSON values")
 	}
@@ -532,7 +532,7 @@ func (table MemTable[T]) ReadAllEntitiesFromRowAsJson(ctx context.Context, row T
 	var buf bytes.Buffer
 	buf.WriteString("[")
 	for _, sortKeyValue := range sortKeyValues {
-		jsonBytes, err := table.ReadEntityFromRowAsJson(ctx, row, partKeyValue, sortKeyValue)
+		jsonBytes, err := table.ReadEntityFromRowAsJSON(ctx, row, partKeyValue, sortKeyValue)
 		if err != nil {
 			continue
 		}

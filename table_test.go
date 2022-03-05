@@ -78,15 +78,15 @@ func TestMain(m *testing.M) {
 	os.Exit(exitVal)
 }
 
-func TestCompressedJson(t *testing.T) {
-	gzJson, err := ToCompressedJson(v11)
+func TestCompressedJSON(t *testing.T) {
+	gzJSON, err := ToCompressedJSON(v11)
 	if err != nil {
-		t.Fatalf("ToCompressedJson failed: %v", err)
+		t.Fatalf("ToCompressedJSON failed: %v", err)
 	}
 	var v11Check VersionableThing
-	err = FromCompressedJson(gzJson, &v11Check)
+	err = FromCompressedJSON(gzJSON, &v11Check)
 	if err != nil {
-		t.Errorf("FromCompressedJson failed: %v", err)
+		t.Errorf("FromCompressedJSON failed: %v", err)
 	} else if !reflect.DeepEqual(v11, v11Check) {
 		t.Errorf("v11 and v11Check are not equal")
 	}
@@ -246,9 +246,9 @@ func TestTable_ReadEntities(t *testing.T) {
 	}
 }
 
-func TestTable_ReadEntitiesAsJson(t *testing.T) {
+func TestTable_ReadEntitiesAsJSON(t *testing.T) {
 	ids := []string{v11.ID, v20.ID}
-	jsonBytes := tableReader.ReadEntitiesAsJson(ctx, ids)
+	jsonBytes := tableReader.ReadEntitiesAsJSON(ctx, ids)
 	if len(jsonBytes) == 0 {
 		t.Fatalf("expected JSON bytes, got %d", len(jsonBytes))
 	}
@@ -275,9 +275,9 @@ func TestTable_ReadEntity(t *testing.T) {
 		t.Errorf("expected an error, got nil")
 	}
 	// Read an entity as JSON
-	jsonBytes, err := tableReader.ReadEntityAsJson(ctx, v11.ID)
+	jsonBytes, err := tableReader.ReadEntityAsJSON(ctx, v11.ID)
 	if err != nil {
-		t.Errorf("ReadEntityAsJson failed: %v", err)
+		t.Errorf("ReadEntityAsJSON failed: %v", err)
 	} else if !strings.Contains(string(jsonBytes), v11.ID) {
 		t.Errorf("expected JSON to contain entity ID, got %s", string(jsonBytes))
 	}
@@ -380,15 +380,15 @@ func TestTable_ReadEntitiesFromRow(t *testing.T) {
 	}
 }
 
-func TestTable_ReadEntitiesFromRowAsJson(t *testing.T) {
+func TestTable_ReadEntitiesFromRowAsJSON(t *testing.T) {
 	row := tableReader.GetRow("thingsDay")
 	if !row.IsValid() {
 		t.Fatalf("thingsDay row not found")
 	}
 	day := row.PartKeyValue(v11)
-	jsonBytes, err := tableReader.ReadAllEntitiesFromRowAsJson(ctx, row, day)
+	jsonBytes, err := tableReader.ReadAllEntitiesFromRowAsJSON(ctx, row, day)
 	if err != nil {
-		t.Fatalf("ReadAllEntitiesFromRowAsJson failed: %v", err)
+		t.Fatalf("ReadAllEntitiesFromRowAsJSON failed: %v", err)
 	} else if len(jsonBytes) == 0 {
 		t.Fatalf("expected JSON, got %d", len(jsonBytes))
 	}
@@ -614,10 +614,10 @@ func (v VersionableThing) UpdatedOn() string {
 	return v.UpdatedAt.Format("2006-01-02")
 }
 
-// CompressedJson returns a compressed JSON representation of the VersionableThing.
-func (v VersionableThing) CompressedJson() []byte {
-	gzJson, _ := ToCompressedJson(v)
-	return gzJson
+// CompressedJSON returns a compressed JSON representation of the VersionableThing.
+func (v VersionableThing) CompressedJSON() []byte {
+	gzJSON, _ := ToCompressedJSON(v)
+	return gzJSON
 }
 
 // CreateVersionableThing creates a new VersionableThing with a new ID and UpdateID based on the current system time.
@@ -638,11 +638,11 @@ func CreateVersionableThing(msg string, count int, tags []string) VersionableThi
 
 // UpdateVersionableThing updates the message of a VersionableThing, along with it's UpdateID and UpdatedAt timestamp.
 func UpdateVersionableThing(v VersionableThing, msg string, count int, tags []string) VersionableThing {
-	updateId := tuid.NewID()
-	updatedAt, _ := updateId.Time()
+	updateID := tuid.NewID()
+	updatedAt, _ := updateID.Time()
 	return VersionableThing{
 		ID:        v.ID,
-		UpdateID:  updateId.String(),
+		UpdateID:  updateID.String(),
 		CreatedAt: v.CreatedAt,
 		UpdatedAt: updatedAt,
 		ExpiresAt: updatedAt.AddDate(1, 0, 0), // expires in one year
@@ -663,7 +663,7 @@ func NewThingTable(dbClient *dynamodb.Client, env string) Table[VersionableThing
 		PartKeyValues: nil,
 		SortKeyName:   "updateId",
 		SortKeyValue:  func(v VersionableThing) string { return v.UpdateID },
-		JsonValue:     func(v VersionableThing) []byte { return v.CompressedJson() },
+		JsonValue:     func(v VersionableThing) []byte { return v.CompressedJSON() },
 		TextValue:     nil,
 		NumericValue:  nil,
 		TimeToLive:    func(v VersionableThing) int64 { return v.ExpiresAt.Unix() },
@@ -677,7 +677,7 @@ func NewThingTable(dbClient *dynamodb.Client, env string) Table[VersionableThing
 		PartKeyValues: nil,
 		SortKeyName:   "id",
 		SortKeyValue:  func(v VersionableThing) string { return v.ID },
-		JsonValue:     func(v VersionableThing) []byte { return v.CompressedJson() },
+		JsonValue:     func(v VersionableThing) []byte { return v.CompressedJSON() },
 		TextValue:     nil,
 		NumericValue:  nil,
 		TimeToLive:    func(v VersionableThing) int64 { return v.ExpiresAt.Unix() },

@@ -64,13 +64,13 @@ func MakeBatches[T any](items []T, batchSize int) [][]T {
 	return batches
 }
 
-// ToJson converts the provided entity to a JSON byte slice.
-func ToJson[T any](entity T) ([]byte, error) {
+// ToJSON converts the provided entity to a JSON byte slice.
+func ToJSON[T any](entity T) ([]byte, error) {
 	return json.Marshal(entity)
 }
 
-// ToCompressedJson converts the provided entity to a JSON string and compresses it.
-func ToCompressedJson[T any](entity T) ([]byte, error) {
+// ToCompressedJSON converts the provided entity to a JSON string and compresses it.
+func ToCompressedJSON[T any](entity T) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	if err := json.NewEncoder(gz).Encode(entity); err != nil {
@@ -82,14 +82,14 @@ func ToCompressedJson[T any](entity T) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// FromJson converts the provided JSON string to an entity.
-func FromJson[T any](jsonStr []byte, entity *T) error {
+// FromJSON converts the provided JSON string to an entity.
+func FromJSON[T any](jsonStr []byte, entity *T) error {
 	return json.NewDecoder(bytes.NewReader(jsonStr)).Decode(entity)
 }
 
-// FromCompressedJson converts the provided compressed JSON string to an entity.
-func FromCompressedJson[T any](gzJson []byte, entity *T) error {
-	gz, err := gzip.NewReader(bytes.NewReader(gzJson))
+// FromCompressedJSON converts the provided compressed JSON string to an entity.
+func FromCompressedJSON[T any](gzJSON []byte, entity *T) error {
+	gz, err := gzip.NewReader(bytes.NewReader(gzJSON))
 	if err != nil {
 		return err
 	}
@@ -99,10 +99,10 @@ func FromCompressedJson[T any](gzJson []byte, entity *T) error {
 	return gz.Close()
 }
 
-// UncompressJson converts the provided compressed bytes to a JSON byte slice.
-func UncompressJson(gzJson []byte) ([]byte, error) {
+// UncompressJSON converts the provided compressed bytes to a JSON byte slice.
+func UncompressJSON(gzJSON []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	gz, err := gzip.NewReader(bytes.NewReader(gzJson))
+	gz, err := gzip.NewReader(bytes.NewReader(gzJSON))
 	if err != nil {
 		return nil, err
 	}
