@@ -725,6 +725,9 @@ func (table Table[T]) EntityExists(ctx context.Context, entityID string) bool {
 
 // EntityVersionExists checks if an entity version exists in the table.
 func (table Table[T]) EntityVersionExists(ctx context.Context, entityID string, versionID string) bool {
+	if entityID == "" || versionID == "" {
+		return false
+	}
 	req := dynamodb.GetItemInput{
 		TableName: aws.String(table.TableName),
 		Key: map[string]types.AttributeValue{
@@ -741,6 +744,9 @@ func (table Table[T]) EntityVersionExists(ctx context.Context, entityID string, 
 // If an entity does not exist, it will be omitted from the results.
 func (table Table[T]) ReadEntities(ctx context.Context, entityIDs []string) []T {
 	entities := make([]T, 0)
+	if len(entityIDs) == 0 {
+		return entities
+	}
 	var batches [][]string
 	maxBatchSize := 10 // concurrent request limit
 	batches = MakeBatches(entityIDs, maxBatchSize)
@@ -772,6 +778,9 @@ func (table Table[T]) ReadEntities(ctx context.Context, entityIDs []string) []T 
 // ReadEntitiesAsJSON reads the current versions of the specified entities from the EntityRow as a JSON byte slice.
 // If an entity does not exist, it will be omitted from the results.
 func (table Table[T]) ReadEntitiesAsJSON(ctx context.Context, entityIDs []string) []byte {
+	if len(entityIDs) == 0 {
+		return nil
+	}
 	var entities bytes.Buffer
 	entities.WriteString("[")
 	var i int
@@ -837,7 +846,7 @@ func (table Table[T]) ReadEntityAsCompressedJSON(ctx context.Context, entityID s
 		return nil, errors.New("the EntityRow must contain compressed JSON values")
 	}
 	if entityID == "" {
-		return nil, errors.New("the entity ID must be provided")
+		return nil, ErrNotFound
 	}
 	// Read the current version of a versioned entity
 	req := dynamodb.QueryInput{
@@ -923,6 +932,9 @@ func (table Table[T]) ReadEntityFromRowAsCompressedJSON(ctx context.Context, row
 	if row.JsonValue == nil {
 		return nil, errors.New("row " + row.RowName + " must contain compressed JSON values")
 	}
+	if partKeyValue == "" || sortKeyValue == "" {
+		return nil, ErrNotFound
+	}
 	req := dynamodb.GetItemInput{
 		TableName: aws.String(table.TableName),
 		Key: map[string]types.AttributeValue{
@@ -946,6 +958,9 @@ func (table Table[T]) ReadEntitiesFromRow(ctx context.Context, row TableRow[T], 
 	entities := make([]T, 0)
 	if row.JsonValue == nil {
 		return entities, errors.New("row " + row.RowName + " must contain compressed JSON values")
+	}
+	if partKeyValue == "" {
+		return entities, nil
 	}
 	keyConditionExpression := "#p = :p and #s > :s"
 	if reverse {
@@ -989,6 +1004,9 @@ func (table Table[T]) ReadEntitiesFromRow(ctx context.Context, row TableRow[T], 
 func (table Table[T]) ReadEntitiesFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]byte, error) {
 	if row.JsonValue == nil {
 		return nil, errors.New("row " + row.RowName + " must contain compressed JSON values")
+	}
+	if partKeyValue == "" {
+		return nil, nil
 	}
 	keyConditionExpression := "#p = :p and #s > :s"
 	if reverse {
@@ -1040,6 +1058,9 @@ func (table Table[T]) ReadAllEntitiesFromRow(ctx context.Context, row TableRow[T
 	if row.JsonValue == nil {
 		return entities, errors.New("row " + row.RowName + " must contain compressed JSON values")
 	}
+	if partKeyValue == "" {
+		return entities, nil
+	}
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
@@ -1079,6 +1100,9 @@ func (table Table[T]) ReadAllEntitiesFromRow(ctx context.Context, row TableRow[T
 func (table Table[T]) ReadAllEntitiesFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string) ([]byte, error) {
 	if row.JsonValue == nil {
 		return nil, errors.New("row " + row.RowName + " must contain compressed JSON values")
+	}
+	if partKeyValue == "" {
+		return nil, nil
 	}
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
@@ -1127,6 +1151,9 @@ func (table Table[T]) ReadTextValue(ctx context.Context, row TableRow[T], partKe
 	if row.TextValue == nil {
 		return textValue, errors.New("row " + row.RowName + " must contain text values")
 	}
+	if partKeyValue == "" || sortKeyValue == "" {
+		return textValue, ErrNotFound
+	}
 	req := dynamodb.GetItemInput{
 		TableName: aws.String(table.TableName),
 		Key: map[string]types.AttributeValue{
@@ -1152,6 +1179,9 @@ func (table Table[T]) ReadTextValues(ctx context.Context, row TableRow[T], partK
 	textValues := make([]TextValue, 0)
 	if row.TextValue == nil {
 		return textValues, errors.New("row " + row.RowName + " must contain text values")
+	}
+	if partKeyValue == "" {
+		return textValues, nil
 	}
 	keyConditionExpression := "#p = :p and #s > :s"
 	if reverse {
@@ -1194,6 +1224,9 @@ func (table Table[T]) ReadAllTextValues(ctx context.Context, row TableRow[T], pa
 	if row.TextValue == nil {
 		return textValues, errors.New("row " + row.RowName + " must contain text values")
 	}
+	if partKeyValue == "" {
+		return textValues, nil
+	}
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
@@ -1235,6 +1268,9 @@ func (table Table[T]) ReadNumericValue(ctx context.Context, row TableRow[T], par
 	if row.NumericValue == nil {
 		return numValue, errors.New("row " + row.RowName + " must contain numeric values")
 	}
+	if partKeyValue == "" || sortKeyValue == "" {
+		return numValue, ErrNotFound
+	}
 	req := dynamodb.GetItemInput{
 		TableName: aws.String(table.TableName),
 		Key: map[string]types.AttributeValue{
@@ -1260,6 +1296,9 @@ func (table Table[T]) ReadNumericValues(ctx context.Context, row TableRow[T], pa
 	numValues := make([]NumValue, 0)
 	if row.NumericValue == nil {
 		return numValues, errors.New("row " + row.RowName + " must contain numeric values")
+	}
+	if partKeyValue == "" {
+		return numValues, nil
 	}
 	keyConditionExpression := "#p = :p and #s > :s"
 	if reverse {
@@ -1301,6 +1340,9 @@ func (table Table[T]) ReadAllNumericValues(ctx context.Context, row TableRow[T],
 	numValues := make([]NumValue, 0)
 	if row.NumericValue == nil {
 		return numValues, errors.New("row " + row.RowName + " must contain numeric values")
+	}
+	if partKeyValue == "" {
+		return numValues, nil
 	}
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
