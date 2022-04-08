@@ -47,7 +47,7 @@ func (table MemTable[T]) IsValid() bool {
 
 // GetRow returns the specified row definition.
 func (table MemTable[T]) GetRow(rowName string) TableRow[T] {
-	if rowName == "EntityRow" {
+	if rowName == table.EntityRow.RowName {
 		return table.EntityRow
 	}
 	return table.IndexRows[rowName]
@@ -61,12 +61,6 @@ func (table MemTable[T]) GetEntityRow() TableRow[T] {
 // TableExists returns true if the in-memory table exists.
 func (table MemTable[T]) TableExists() bool {
 	return table.Records != nil
-}
-
-// CreateTable initializes an in-memory table for the entity.
-func (table MemTable[T]) CreateTable() {
-	dataStore := make(RecordSet)
-	table.Records = &dataStore
 }
 
 func (table MemTable[T]) writeRecords(records []Record) {

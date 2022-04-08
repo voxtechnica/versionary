@@ -260,7 +260,7 @@ type Table[T any] struct {
 
 // GetRow returns the specified row definition.
 func (table Table[T]) GetRow(rowName string) TableRow[T] {
-	if rowName == "EntityRow" {
+	if rowName == table.EntityRow.RowName {
 		return table.EntityRow
 	}
 	return table.IndexRows[rowName]

@@ -52,6 +52,9 @@ func TestMain(m *testing.M) {
 	InitTestDatabase(ctx, memTable)
 	tableReader = memTable
 	exitVal := m.Run()
+	if exitVal != 0 {
+		os.Exit(exitVal)
+	}
 
 	fmt.Println("Running the DynamoDB TableReader tests ...")
 	InitTestDatabase(ctx, table)
@@ -605,12 +608,18 @@ type VersionableThing struct {
 // CreatedOn returns an ISO-8601 formatted string date from the CreatedAt timestamp.
 // It is used for testing entity Table functionality (grouping things by date).
 func (v VersionableThing) CreatedOn() string {
+	if v.CreatedAt.IsZero() {
+		return ""
+	}
 	return v.CreatedAt.Format("2006-01-02")
 }
 
 // UpdatedOn returns an ISO-8601 formatted string date from the UpdatedAt timestamp.
 // It is used for testing entity Table functionality (grouping things by date).
 func (v VersionableThing) UpdatedOn() string {
+	if v.UpdatedAt.IsZero() {
+		return ""
+	}
 	return v.UpdatedAt.Format("2006-01-02")
 }
 
