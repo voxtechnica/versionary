@@ -1,9 +1,7 @@
 package versionary
 
 import (
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"sort"
-	"strconv"
 )
 
 // TextValue represents a key-value pair where the value is a string.
@@ -18,109 +16,21 @@ type NumValue struct {
 	Value float64 `json:"value"`
 }
 
-// Record is a struct that represents a single item in a database table. Although DynamoDB AttributeValue struct tags
-// are provided for marshalling and unmarshalling, using ToItem() and FromItem() are preferred because they are much
-// less computationally intensive.
+// Record is a struct that represents a single item in a database table. PartKeyValue and SortKeyValue
+// are used to represent the primary key and are required fields. All other fields are optional.
+// Note that the PartKeyValue will be a full pipe-delimited partition key: rowName|partKeyName|partKeyValue.
 type Record struct {
-	PartKeyValue string  `dynamodbav:"v_part"`
-	SortKeyValue string  `dynamodbav:"v_sort"`
-	JsonValue    []byte  `dynamodbav:"v_json,omitempty"`
-	TextValue    string  `dynamodbav:"v_text,omitempty"`
-	NumericValue float64 `dynamodbav:"v_num,omitempty"`
-	TimeToLive   int64   `dynamodbav:"v_expires,omitempty"`
+	PartKeyValue string
+	SortKeyValue string
+	JsonValue    []byte
+	TextValue    string
+	NumericValue float64
+	TimeToLive   int64
 }
 
 // IsValid returns true if the Record is valid (all required fields are supplied).
 func (r *Record) IsValid() bool {
 	return r.PartKeyValue != "" && r.SortKeyValue != ""
-}
-
-// FromItem converts a DynamoDB AttributeValue map (an "item") to a Record.
-func (r *Record) FromItem(item map[string]types.AttributeValue) {
-	// Zero out the struct in preparation for new values (in case it's being reused).
-	r.PartKeyValue = ""
-	r.SortKeyValue = ""
-	r.JsonValue = nil
-	r.TextValue = ""
-	r.NumericValue = 0
-	r.TimeToLive = 0
-	if item == nil {
-		return
-	}
-	if v, ok := item["v_part"]; ok {
-		r.PartKeyValue = v.(*types.AttributeValueMemberS).Value
-	}
-	if v, ok := item["v_sort"]; ok {
-		r.SortKeyValue = v.(*types.AttributeValueMemberS).Value
-	}
-	if v, ok := item["v_json"]; ok {
-		r.JsonValue = v.(*types.AttributeValueMemberB).Value
-	}
-	if v, ok := item["v_text"]; ok {
-		r.TextValue = v.(*types.AttributeValueMemberS).Value
-	}
-	if v, ok := item["v_num"]; ok {
-		r.NumericValue, _ = strconv.ParseFloat(v.(*types.AttributeValueMemberN).Value, 64)
-	}
-	if v, ok := item["v_expires"]; ok {
-		r.TimeToLive, _ = strconv.ParseInt(v.(*types.AttributeValueMemberN).Value, 10, 64)
-	}
-}
-
-// ToItem converts a Record to a DynamoDB AttributeValue map (an "item").
-func (r *Record) ToItem() map[string]types.AttributeValue {
-	item := map[string]types.AttributeValue{}
-	if r.PartKeyValue != "" {
-		item["v_part"] = &types.AttributeValueMemberS{Value: r.PartKeyValue}
-	}
-	if r.SortKeyValue != "" {
-		item["v_sort"] = &types.AttributeValueMemberS{Value: r.SortKeyValue}
-	}
-	if r.JsonValue != nil {
-		item["v_json"] = &types.AttributeValueMemberB{Value: r.JsonValue}
-	}
-	if r.TextValue != "" {
-		item["v_text"] = &types.AttributeValueMemberS{Value: r.TextValue}
-	}
-	if r.NumericValue != 0 {
-		item["v_num"] = &types.AttributeValueMemberN{Value: strconv.FormatFloat(r.NumericValue, 'f', -1, 64)}
-	}
-	if r.TimeToLive != 0 {
-		item["v_expires"] = &types.AttributeValueMemberN{Value: strconv.FormatInt(r.TimeToLive, 10)}
-	}
-	return item
-}
-
-// ToKey converts a Record to a DynamoDB AttributeValue map (an "item") for hash and range keys.
-func (r *Record) ToKey() map[string]types.AttributeValue {
-	item := map[string]types.AttributeValue{}
-	if r.PartKeyValue != "" {
-		item["v_part"] = &types.AttributeValueMemberS{Value: r.PartKeyValue}
-	}
-	if r.SortKeyValue != "" {
-		item["v_sort"] = &types.AttributeValueMemberS{Value: r.SortKeyValue}
-	}
-	return item
-}
-
-// ToTextValue extracts the text value from a Record.
-func (r *Record) ToTextValue() TextValue {
-	return TextValue{Key: r.SortKeyValue, Value: r.TextValue}
-}
-
-// ToNumValue extracts the numeric value from a Record.
-func (r *Record) ToNumValue() NumValue {
-	return NumValue{Key: r.SortKeyValue, Value: r.NumericValue}
-}
-
-// PutRequest converts the Record to a DynamoDB WriteRequest containing a PutRequest.
-func (r *Record) PutRequest() types.WriteRequest {
-	return types.WriteRequest{PutRequest: &types.PutRequest{Item: r.ToItem()}}
-}
-
-// DeleteRequest converts the Record to a DynamoDB WriteRequest containing a DeleteRequest.
-func (r *Record) DeleteRequest() types.WriteRequest {
-	return types.WriteRequest{DeleteRequest: &types.DeleteRequest{Key: r.ToKey()}}
 }
 
 // RecordSet provides an in-memory data structure for storing a set of Records, used for lightweight testing purposes.
