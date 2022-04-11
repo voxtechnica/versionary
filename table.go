@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,11 +16,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
-	"github.com/voxtechnica/tuid-go"
 )
 
 // ErrNotFound is returned when a specified thing is not found
-var ErrNotFound = errors.New("not found")
+var ErrNotFound = errors.New("versionary: not found")
 
 // TableWriter is the interface that defines methods for writing, updating, or deleting an entity from a DynamoDB table
 // based on an opinionated implementation of DynamoDB by Table.
@@ -33,21 +34,24 @@ type TableWriter[T any] interface {
 // TableReader is the interface that defines methods for reading entity-related information from a DynamoDB table based
 // on an opinionated implementation of DynamoDB by Table.
 type TableReader[T any] interface {
-	GetRow(rowName string) TableRow[T]
+	GetRow(rowName string) (TableRow[T], bool)
 	GetEntityRow() TableRow[T]
+	EntityID(entity T) string
+	EntityVersionID(entity T) string
+	EntityReferenceID(entity T) string
+	EntityExists(ctx context.Context, entityID string) bool
+	EntityVersionExists(ctx context.Context, entityID string, versionID string) bool
 	ReadAllPartKeyValues(ctx context.Context, row TableRow[T]) ([]string, error)
 	ReadAllSortKeyValues(ctx context.Context, row TableRow[T], partKeyValue string) ([]string, error)
 	ReadPartKeyValues(ctx context.Context, row TableRow[T], reverse bool, limit int, offset string) ([]string, error)
 	ReadSortKeyValues(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]string, error)
-	ReadFirstSortKeyID(ctx context.Context, row TableRow[T], partKeyValue string) (string, error)
-	ReadLastSortKeyID(ctx context.Context, row TableRow[T], partKeyValue string) (string, error)
+	ReadFirstSortKeyValue(ctx context.Context, row TableRow[T], partKeyValue string) (string, error)
+	ReadLastSortKeyValue(ctx context.Context, row TableRow[T], partKeyValue string) (string, error)
 	ReadAllEntityIDs(ctx context.Context) ([]string, error)
 	ReadEntityIDs(ctx context.Context, reverse bool, limit int, offset string) ([]string, error)
 	ReadAllEntityVersionIDs(ctx context.Context, entityID string) ([]string, error)
 	ReadEntityVersionIDs(ctx context.Context, entityID string, reverse bool, limit int, offset string) ([]string, error)
 	ReadCurrentEntityVersionID(ctx context.Context, entityID string) (string, error)
-	EntityExists(ctx context.Context, entityID string) bool
-	EntityVersionExists(ctx context.Context, entityID string, versionID string) bool
 	ReadEntities(ctx context.Context, entityIDs []string) []T
 	ReadEntitiesAsJSON(ctx context.Context, entityIDs []string) []byte
 	ReadEntity(ctx context.Context, entityID string) (T, error)
@@ -66,6 +70,9 @@ type TableReader[T any] interface {
 	ReadEntitiesFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]byte, error)
 	ReadAllEntitiesFromRow(ctx context.Context, row TableRow[T], partKeyValue string) ([]T, error)
 	ReadAllEntitiesFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string) ([]byte, error)
+	ReadRecord(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (Record, error)
+	ReadRecords(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]Record, error)
+	ReadAllRecords(ctx context.Context, row TableRow[T], partKeyValue string) ([]Record, error)
 	ReadTextValue(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (TextValue, error)
 	ReadTextValues(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]TextValue, error)
 	ReadAllTextValues(ctx context.Context, row TableRow[T], partKeyValue string, sortByValue bool) ([]TextValue, error)
@@ -83,9 +90,9 @@ type TableReadWriter[T any] interface {
 // TableRow represents a single "wide row" in an Entity Table. A "wide row" is used to quickly provide a response to a
 // specific query, or question for the data. Example: "What error events occurred on this day?"
 //
-// The following attributes are stored in the table:
+// The following attributes are stored in the table. These attribute names are configurable.
 //  - v_part: partition key (required)
-//  - v_sort: sorting key (required; for an entity without versions, reuse the partition key)
+//  - v_sort: sorting key (required; for an entity row without versions, reuse the partition key)
 //  - v_json: gzip compressed JSON data (optional)
 //  - v_text: string value (optional)
 //  - v_num: double-wide floating point numeric value (optional)
@@ -93,9 +100,9 @@ type TableReadWriter[T any] interface {
 //
 // Pipe-separated key values are used to avoid naming collisions, supporting multiple row types in a single table:
 // Entity Values: rowName|partKeyName|partKeyValue -- (sortKeyValue, value), (sortKeyValue, value), ...
-// Partition Keys: rowName|partKeyName -- (partKeyValue, count), (partKeyValue, count), ...
+// Partition Keys: rowName|partKeyName -- partKeyValue, partKeyValue, ...
 // Note that in addition to storing the entity data in a given row, we're also storing the partition key values used
-// for each row, to support queries that "walk" the entire data set.
+// for each row, to support queries that "walk" the entire data set for a given row type.
 type TableRow[T any] struct {
 	RowName       string
 	PartKeyName   string
@@ -205,14 +212,14 @@ func (row TableRow[T]) getWriteRecords(entity T) []Record {
 
 		// Track the unique partition key values for this row
 		// Partition Keys: rowName|partKeyName -- partKeyValue, partKeyValue, ...
-		rKey := Record{
+		k := Record{
 			PartKeyValue: row.getRowPartKey(), // rowName|partKeyName
 			SortKeyValue: partKeyValue,
 		}
 		if row.TimeToLive != nil {
-			rKey.TimeToLive = row.TimeToLive(entity)
+			k.TimeToLive = row.TimeToLive(entity)
 		}
-		records = append(records, rKey)
+		records = append(records, k)
 	}
 	return records
 }
@@ -246,24 +253,164 @@ func (row TableRow[T]) getDeleteRecordsForKeys(partKeyValues []string, sortKeyVa
 }
 
 // Table represents a single DynamoDB table that stores all the "wide rows" for a given entity. Denormalized
-// entity data are stored in a single table, reusing the attribute names indicated in the TableRow definition.
+// entity data are stored in a single table, reusing the attribute names indicated in the Table definition.
 // The EntityRow is special; it contains the revision history for the entity, whereas the IndexRows contain only
 // values from the latest revision of the entity.
 type Table[T any] struct {
-	Client     *dynamodb.Client
-	EntityType string
-	TableName  string
-	TTL        bool
-	EntityRow  TableRow[T]
-	IndexRows  map[string]TableRow[T]
+	Client           *dynamodb.Client       // AWS DynamoDB client
+	EntityType       string                 // the type of entity stored in this table
+	TableName        string                 // name of the table, typically including the entity type and environment name
+	PartKeyAttr      string                 // partition key attribute name (e.g. "v_part")
+	SortKeyAttr      string                 // sort key attribute name (e.g. "v_sort")
+	JsonValueAttr    string                 // JSON value attribute name (e.g. "v_json")
+	TextValueAttr    string                 // text value attribute name (e.g. "v_text")
+	NumericValueAttr string                 // numeric value attribute name (e.g. "v_num")
+	TimeToLiveAttr   string                 // time to live attribute name (e.g. "v_expires")
+	TTL              bool                   // true if the table has a time to live attribute
+	EntityRow        TableRow[T]            // the row that stores the entity versions
+	IndexRows        map[string]TableRow[T] // index rows, based on various entity properties
+}
+
+// IsValid returns true if the table fields and rows are valid.
+func (table Table[T]) IsValid() bool {
+	for _, row := range table.IndexRows {
+		if !row.IsValid() {
+			return false
+		}
+	}
+	return table.Client != nil && table.EntityType != "" && table.TableName != "" && table.EntityRow.IsValid()
+}
+
+// itemToRecord converts a DynamoDB AttributeValue map (an "item") to a Record.
+func (table Table[T]) itemToRecord(item map[string]types.AttributeValue) Record {
+	r := Record{}
+	if item == nil {
+		return r
+	}
+	if v, ok := item[table.getPartKeyAttr()]; ok {
+		r.PartKeyValue = v.(*types.AttributeValueMemberS).Value
+	}
+	if v, ok := item[table.getSortKeyAttr()]; ok {
+		r.SortKeyValue = v.(*types.AttributeValueMemberS).Value
+	}
+	if v, ok := item[table.getJsonValueAttr()]; ok {
+		r.JsonValue = v.(*types.AttributeValueMemberB).Value
+	}
+	if v, ok := item[table.getTextValueAttr()]; ok {
+		r.TextValue = v.(*types.AttributeValueMemberS).Value
+	}
+	if v, ok := item[table.getNumericValueAttr()]; ok {
+		r.NumericValue, _ = strconv.ParseFloat(v.(*types.AttributeValueMemberN).Value, 64)
+	}
+	if v, ok := item[table.getTimeToLiveAttr()]; ok {
+		r.TimeToLive, _ = strconv.ParseInt(v.(*types.AttributeValueMemberN).Value, 10, 64)
+	}
+	return r
+}
+
+// putRequest converts a Record to a DynamoDB WriteRequest containing a PutRequest.
+func (table Table[T]) putRequest(r Record) types.WriteRequest {
+	item := map[string]types.AttributeValue{}
+	if r.PartKeyValue != "" {
+		item[table.getPartKeyAttr()] = &types.AttributeValueMemberS{Value: r.PartKeyValue}
+	}
+	if r.SortKeyValue != "" {
+		item[table.getSortKeyAttr()] = &types.AttributeValueMemberS{Value: r.SortKeyValue}
+	}
+	if r.JsonValue != nil {
+		item[table.getJsonValueAttr()] = &types.AttributeValueMemberB{Value: r.JsonValue}
+	}
+	if r.TextValue != "" {
+		item[table.getTextValueAttr()] = &types.AttributeValueMemberS{Value: r.TextValue}
+	}
+	if r.NumericValue != 0 {
+		item[table.getNumericValueAttr()] = &types.AttributeValueMemberN{Value: strconv.FormatFloat(r.NumericValue, 'f', -1, 64)}
+	}
+	if r.TimeToLive != 0 {
+		item[table.getTimeToLiveAttr()] = &types.AttributeValueMemberN{Value: strconv.FormatInt(r.TimeToLive, 10)}
+	}
+	return types.WriteRequest{PutRequest: &types.PutRequest{Item: item}}
+}
+
+// deleteRequest converts a Record to a DynamoDB WriteRequest containing a DeleteRequest.
+func (table Table[T]) deleteRequest(r Record) types.WriteRequest {
+	key := map[string]types.AttributeValue{}
+	if r.PartKeyValue != "" {
+		key[table.getPartKeyAttr()] = &types.AttributeValueMemberS{Value: r.PartKeyValue}
+	}
+	if r.SortKeyValue != "" {
+		key[table.getSortKeyAttr()] = &types.AttributeValueMemberS{Value: r.SortKeyValue}
+	}
+	return types.WriteRequest{DeleteRequest: &types.DeleteRequest{Key: key}}
+}
+
+// getPartKeyAttr returns the configured partition key attribute name. The default is "part_key".
+func (table Table[T]) getPartKeyAttr() string {
+	if table.PartKeyAttr == "" {
+		return "part_key"
+	}
+	return table.PartKeyAttr
+}
+
+// getSortKeyAttr returns the configured sort key attribute name. The default is "sort_key".
+func (table Table[T]) getSortKeyAttr() string {
+	if table.SortKeyAttr == "" {
+		return "sort_key"
+	}
+	return table.SortKeyAttr
+}
+
+// getJsonValueAttr returns the configured JSON value attribute name. The default is "json_value".
+func (table Table[T]) getJsonValueAttr() string {
+	if table.JsonValueAttr == "" {
+		return "json_value"
+	}
+	return table.JsonValueAttr
+}
+
+// getTextValueAttr returns the configured text value attribute name. The default is "text_value".
+func (table Table[T]) getTextValueAttr() string {
+	if table.TextValueAttr == "" {
+		return "text_value"
+	}
+	return table.TextValueAttr
+}
+
+// getNumericValueAttr returns the configured numeric value attribute name. The default is "num_value".
+func (table Table[T]) getNumericValueAttr() string {
+	if table.NumericValueAttr == "" {
+		return "num_value"
+	}
+	return table.NumericValueAttr
+}
+
+// getTimeToLiveAttr returns the configured time to live attribute name. The default is "expires_at".
+func (table Table[T]) getTimeToLiveAttr() string {
+	if table.TimeToLiveAttr == "" {
+		return "expires_at"
+	}
+	return table.TimeToLiveAttr
+}
+
+// getAttributeNames returns a slice of all configured attribute names.
+func (table Table[T]) getAttributeNames() []string {
+	return []string{
+		table.getPartKeyAttr(),
+		table.getSortKeyAttr(),
+		table.getJsonValueAttr(),
+		table.getTextValueAttr(),
+		table.getNumericValueAttr(),
+		table.getTimeToLiveAttr(),
+	}
 }
 
 // GetRow returns the specified row definition.
-func (table Table[T]) GetRow(rowName string) TableRow[T] {
-	if rowName == "EntityRow" {
-		return table.EntityRow
+func (table Table[T]) GetRow(rowName string) (TableRow[T], bool) {
+	if rowName == table.EntityRow.RowName {
+		return table.EntityRow, true
 	}
-	return table.IndexRows[rowName]
+	row, ok := table.IndexRows[rowName]
+	return row, ok
 }
 
 // GetEntityRow returns the entity row definition. This row contains the revision history for the entity.
@@ -272,24 +419,28 @@ func (table Table[T]) GetEntityRow() TableRow[T] {
 }
 
 // GetTableDescription fetches metadata about the DynamoDB table.
-func (table Table[T]) GetTableDescription(ctx context.Context) (*dynamodb.DescribeTableOutput, error) {
-	return table.Client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+func (table Table[T]) GetTableDescription(ctx context.Context) (*types.TableDescription, error) {
+	res, err := table.Client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
 		TableName: aws.String(table.TableName),
 	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to describe table %s: %w", table.TableName, err)
+	}
+	return res.Table, nil
 }
 
 // TableExists returns true if the DynamoDB table exists.
 func (table Table[T]) TableExists(ctx context.Context) bool {
-	startTime := time.Now()
 	desc, err := table.GetTableDescription(ctx)
 	if err != nil {
 		// Table Not Found is an expected error
 		var nf *types.ResourceNotFoundException
 		if errors.As(err, &nf) {
-			log.Printf("table %s %s", table.TableName, nf.ErrorCode())
+			log.Println("table", table.TableName, nf.ErrorCode())
 			return false
 		}
 		// Identify other possible errors
+		log.Println(err.Error())
 		var oe *smithy.OperationError
 		if errors.As(err, &oe) {
 			log.Printf("%s operation %s error: %v\n", oe.Service(), oe.Operation(), oe.Unwrap())
@@ -300,7 +451,7 @@ func (table Table[T]) TableExists(ctx context.Context) bool {
 		}
 		return false
 	}
-	log.Printf("table %s %s in %s\n", *desc.Table.TableName, desc.Table.TableStatus, time.Since(startTime))
+	log.Println("table", *desc.TableName, desc.TableStatus)
 	return true
 }
 
@@ -309,19 +460,19 @@ func (table Table[T]) TableExists(ctx context.Context) bool {
 func (table Table[T]) CreateTable(ctx context.Context) error {
 	startTime := time.Now()
 	partKeyAttr := types.AttributeDefinition{
-		AttributeName: aws.String("v_part"),
+		AttributeName: aws.String(table.getPartKeyAttr()),
 		AttributeType: types.ScalarAttributeTypeS,
 	}
 	sortKeyAttr := types.AttributeDefinition{
-		AttributeName: aws.String("v_sort"),
+		AttributeName: aws.String(table.getSortKeyAttr()),
 		AttributeType: types.ScalarAttributeTypeS,
 	}
 	partKeyDef := types.KeySchemaElement{
-		AttributeName: aws.String("v_part"),
+		AttributeName: aws.String(table.getPartKeyAttr()),
 		KeyType:       types.KeyTypeHash,
 	}
 	sortKeyDef := types.KeySchemaElement{
-		AttributeName: aws.String("v_sort"),
+		AttributeName: aws.String(table.getSortKeyAttr()),
 		KeyType:       types.KeyTypeRange,
 	}
 	req := dynamodb.CreateTableInput{
@@ -331,11 +482,12 @@ func (table Table[T]) CreateTable(ctx context.Context) error {
 		AttributeDefinitions: []types.AttributeDefinition{partKeyAttr, sortKeyAttr},
 		KeySchema:            []types.KeySchemaElement{partKeyDef, sortKeyDef},
 	}
-	res, err := table.Client.CreateTable(ctx, &req)
+	create, err := table.Client.CreateTable(ctx, &req)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create table %s: %w", table.TableName, err)
 	}
-	log.Printf("table %s %s in %s\n", *res.TableDescription.TableName, res.TableDescription.TableStatus, time.Since(startTime))
+	t := create.TableDescription
+	log.Println("table", *t.TableName, t.TableStatus, time.Since(startTime))
 
 	// Use a Waiter to detect the transition from CREATING to ACTIVE:
 	// https://aws.github.io/aws-sdk-go-v2/docs/making-requests/#using-waiters
@@ -343,11 +495,12 @@ func (table Table[T]) CreateTable(ctx context.Context) error {
 		o.MinDelay = 3 * time.Second   // default is 20 seconds
 		o.MaxDelay = 120 * time.Second // default is 120 seconds
 	})
-	desc, err := waiter.WaitForOutput(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table.TableName)}, 3*time.Minute)
+	describe, err := waiter.WaitForOutput(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table.TableName)}, 3*time.Minute)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed waiting for table %s to become active: %w", table.TableName, err)
 	}
-	log.Printf("table %s %s in %s\n", *desc.Table.TableName, desc.Table.TableStatus, time.Since(startTime))
+	t = describe.Table
+	log.Println("table", *t.TableName, t.TableStatus, time.Since(startTime))
 
 	// Update the TTL on the table if requested
 	if table.TTL {
@@ -361,43 +514,91 @@ func (table Table[T]) CreateTable(ctx context.Context) error {
 
 // UpdateTTL updates the DynamoDB table's time-to-live settings.
 func (table Table[T]) UpdateTTL(ctx context.Context) error {
-	startTime := time.Now()
-	req := dynamodb.UpdateTimeToLiveInput{
+	update, err := table.Client.UpdateTimeToLive(ctx, &dynamodb.UpdateTimeToLiveInput{
 		TableName: aws.String(table.TableName),
 		TimeToLiveSpecification: &types.TimeToLiveSpecification{
-			AttributeName: aws.String("v_expires"),
+			AttributeName: aws.String(table.getTimeToLiveAttr()),
 			Enabled:       aws.Bool(table.TTL),
 		},
-	}
-	res, err := table.Client.UpdateTimeToLive(ctx, &req)
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to update TTL on table %s: %w", table.TableName, err)
 	}
-	log.Printf("table %s TTL set to %s %t in %s\n", table.TableName, *res.TimeToLiveSpecification.AttributeName,
-		*res.TimeToLiveSpecification.Enabled, time.Since(startTime))
+	t := update.TimeToLiveSpecification
+	log.Println("table", table.TableName, "TTL", *t.AttributeName, *t.Enabled)
 	return nil
 }
 
 // DeleteTable deletes the DynamoDB table. Note that the table's status may be DELETING for a few seconds.
 func (table Table[T]) DeleteTable(ctx context.Context) error {
-	startTime := time.Now()
-	req := dynamodb.DeleteTableInput{
+	res, err := table.Client.DeleteTable(ctx, &dynamodb.DeleteTableInput{
 		TableName: aws.String(table.TableName),
-	}
-	res, err := table.Client.DeleteTable(ctx, &req)
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to delete table %s: %w", table.TableName, err)
 	}
-	log.Printf("table %s %s in %s\n", *res.TableDescription.TableName, res.TableDescription.TableStatus,
-		time.Since(startTime))
+	t := res.TableDescription
+	log.Println("table", *t.TableName, t.TableStatus)
 	return nil
+}
+
+// EntityID returns the unique entity ID for the provided entity.
+func (table Table[T]) EntityID(entity T) string {
+	if table.EntityRow.PartKeyValue == nil {
+		return ""
+	}
+	return table.EntityRow.PartKeyValue(entity)
+}
+
+// EntityVersionID returns the unique entity version ID for the provided entity.
+func (table Table[T]) EntityVersionID(entity T) string {
+	if table.EntityRow.SortKeyValue == nil {
+		return ""
+	}
+	return table.EntityRow.SortKeyValue(entity)
+}
+
+// EntityReferenceID returns a unique Reference ID (EntityType-ID-VersionID) for the provided entity.
+func (table Table[T]) EntityReferenceID(entity T) string {
+	entityID := table.EntityID(entity)
+	versionID := table.EntityVersionID(entity)
+	if entityID == "" || versionID == "" {
+		return ""
+	}
+	if entityID == versionID {
+		return table.EntityType + "-" + table.EntityID(entity)
+	}
+	return table.EntityType + "-" + table.EntityID(entity) + "-" + table.EntityVersionID(entity)
+}
+
+// EntityExists checks if an entity exists in the table.
+func (table Table[T]) EntityExists(ctx context.Context, entityID string) bool {
+	versionID, err := table.ReadFirstSortKeyValue(ctx, table.EntityRow, entityID)
+	return err == nil && versionID != ""
+}
+
+// EntityVersionExists checks if an entity version exists in the table.
+func (table Table[T]) EntityVersionExists(ctx context.Context, entityID string, versionID string) bool {
+	if entityID == "" || versionID == "" {
+		return false
+	}
+	req := dynamodb.GetItemInput{
+		TableName: aws.String(table.TableName),
+		Key: map[string]types.AttributeValue{
+			table.getPartKeyAttr(): &types.AttributeValueMemberS{Value: table.EntityRow.getRowPartKeyValue(entityID)},
+			table.getSortKeyAttr(): &types.AttributeValueMemberS{Value: versionID},
+		},
+		ProjectionExpression: aws.String(table.getPartKeyAttr() + ", " + table.getSortKeyAttr()),
+	}
+	res, err := table.Client.GetItem(ctx, &req)
+	return err == nil && res.Item != nil && res.Item[table.getPartKeyAttr()] != nil && res.Item[table.getSortKeyAttr()] != nil
 }
 
 // writeBatches bulk-writes the provided WriteRequests to the table, respecting DynamoDB limits:
 // 25 write requests per batch, 16MB per batch, and 400KB per item. For more information, see:
 // https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Limits.html
 func (table Table[T]) writeBatches(ctx context.Context, writeRequests []types.WriteRequest) error {
-	batches := MakeBatches(writeRequests, 25)
+	batches := Batch(writeRequests, 25)
 	for _, batch := range batches {
 		requestItems := map[string][]types.WriteRequest{
 			table.TableName: batch,
@@ -407,7 +608,7 @@ func (table Table[T]) writeBatches(ctx context.Context, writeRequests []types.Wr
 			req := dynamodb.BatchWriteItemInput{RequestItems: requestItems}
 			res, err := table.Client.BatchWriteItem(ctx, &req)
 			if err != nil {
-				return err
+				return fmt.Errorf("failed writing batch to table %s: %w", table.TableName, err)
 			}
 			// Check the response for any unprocessed items and try again
 			if len(res.UnprocessedItems) > 0 {
@@ -428,18 +629,26 @@ func (table Table[T]) WriteEntity(ctx context.Context, entity T) error {
 			records = append(records, row.getWriteRecords(entity)...)
 		}
 	}
-	writeRequests := Map(records, func(r Record) types.WriteRequest { return r.PutRequest() })
-	return table.writeBatches(ctx, writeRequests)
+	writeRequests := Map(records, func(r Record) types.WriteRequest { return table.putRequest(r) })
+	err := table.writeBatches(ctx, writeRequests)
+	if err != nil {
+		return fmt.Errorf("failed writing %s: %w", table.EntityReferenceID(entity), err)
+	}
+	return nil
 }
 
 // UpdateEntity batch-writes the provided entity to each of the wide rows in the table,
-// including deleting any obsolete values in index rows.
+// including deleting any obsolete values in index rows. If a previous version does not exist,
+// it is treated as a new entity.
 func (table Table[T]) UpdateEntity(ctx context.Context, entity T) error {
 	// Fetch the current (obsolete) version of the entity
-	entityID := table.EntityRow.PartKeyValue(entity)
+	entityID := table.EntityID(entity)
 	oldVersion, err := table.ReadEntity(ctx, entityID)
-	if err != nil {
-		return err
+	if err == ErrNotFound {
+		// If the entity doesn't exist, treat it as a new entity
+		return table.WriteEntity(ctx, entity)
+	} else if err != nil {
+		return fmt.Errorf("failed read to update %s-%s: %w", table.EntityType, entityID, err)
 	}
 	// Update the entity with the new version
 	return table.UpdateEntityVersion(ctx, oldVersion, entity)
@@ -450,37 +659,37 @@ func (table Table[T]) UpdateEntity(ctx context.Context, entity T) error {
 func (table Table[T]) UpdateEntityVersion(ctx context.Context, oldVersion T, newVersion T) error {
 	// Generate deletion requests for deleted index row partition keys
 	var deleteRecords []Record
-	if table.IndexRows != nil {
-		for _, row := range table.IndexRows {
-			deletedKeys := row.getDeletedPartKeyValues(oldVersion, newVersion)
-			sortKeyValue := row.SortKeyValue(oldVersion)
-			deleteRecords = append(deleteRecords, row.getDeleteRecordsForKeys(deletedKeys, sortKeyValue)...)
-		}
+	for _, row := range table.IndexRows {
+		deletedKeys := row.getDeletedPartKeyValues(oldVersion, newVersion)
+		sortKeyValue := row.SortKeyValue(oldVersion)
+		deleteRecords = append(deleteRecords, row.getDeleteRecordsForKeys(deletedKeys, sortKeyValue)...)
 	}
-	writeRequests := Map(deleteRecords, func(r Record) types.WriteRequest { return r.DeleteRequest() })
+	writeRequests := Map(deleteRecords, func(r Record) types.WriteRequest { return table.deleteRequest(r) })
 	// Generate put requests for the new version of the entity
 	writeRecords := table.EntityRow.getWriteRecords(newVersion)
-	if table.IndexRows != nil {
-		for _, row := range table.IndexRows {
-			writeRecords = append(writeRecords, row.getWriteRecords(newVersion)...)
-		}
+	for _, row := range table.IndexRows {
+		writeRecords = append(writeRecords, row.getWriteRecords(newVersion)...)
 	}
 	for _, record := range writeRecords {
-		writeRequests = append(writeRequests, record.PutRequest())
+		writeRequests = append(writeRequests, table.putRequest(record))
 	}
 	// Write batches, respecting the specified maximum batch size
-	return table.writeBatches(ctx, writeRequests)
+	err := table.writeBatches(ctx, writeRequests)
+	if err != nil {
+		oldRefId := table.EntityReferenceID(oldVersion)
+		newRefId := table.EntityReferenceID(newVersion)
+		return fmt.Errorf("failed update from %s to %s: %w", oldRefId, newRefId, err)
+	}
+	return nil
 }
 
 // DeleteEntity deletes the provided entity from the table (including all versions).
 func (table Table[T]) DeleteEntity(ctx context.Context, entity T) error {
-	entityID := table.EntityRow.PartKeyValue(entity)
+	entityID := table.EntityID(entity)
 	// Delete index row items based on the current version of the entity
 	var deleteRecords []Record
-	if table.IndexRows != nil {
-		for _, row := range table.IndexRows {
-			deleteRecords = append(deleteRecords, row.getDeleteRecords(entity)...)
-		}
+	for _, row := range table.IndexRows {
+		deleteRecords = append(deleteRecords, row.getDeleteRecords(entity)...)
 	}
 	// Delete the entity ID from the list of entity IDs
 	deleteRecords = append(deleteRecords, Record{
@@ -491,7 +700,7 @@ func (table Table[T]) DeleteEntity(ctx context.Context, entity T) error {
 	partKey := table.EntityRow.getRowPartKeyValue(entityID)
 	sortKeys, err := table.ReadAllSortKeyValues(ctx, table.EntityRow, entityID)
 	if err != nil {
-		return err
+		return fmt.Errorf("delete entity: failed reading version IDs for %s-%s: %w", table.EntityType, entityID, err)
 	}
 	for _, sortKey := range sortKeys {
 		deleteRecords = append(deleteRecords, Record{
@@ -500,47 +709,53 @@ func (table Table[T]) DeleteEntity(ctx context.Context, entity T) error {
 		})
 	}
 	// Write the batch
-	writeRequests := Map(deleteRecords, func(r Record) types.WriteRequest { return r.DeleteRequest() })
-	return table.writeBatches(ctx, writeRequests)
+	writeRequests := Map(deleteRecords, func(r Record) types.WriteRequest { return table.deleteRequest(r) })
+	err = table.writeBatches(ctx, writeRequests)
+	if err != nil {
+		return fmt.Errorf("failed deleting %s-%s: %w", table.EntityType, entityID, err)
+	}
+	return nil
 }
 
 // DeleteEntityWithID deletes the specified entity from the table (including all versions).
 func (table Table[T]) DeleteEntityWithID(ctx context.Context, entityID string) (T, error) {
 	entity, err := table.ReadEntity(ctx, entityID)
-	if err != nil {
+	if err == ErrNotFound {
 		return entity, err
+	} else if err != nil {
+		return entity, fmt.Errorf("failed read to delete %s-%s: %w", table.EntityType, entityID, err)
 	}
 	return entity, table.DeleteEntity(ctx, entity)
 }
 
-// DeleteRow deletes the row for the specified partition key.
+// DeleteRow deletes the entire row for the specified partition key.
 func (table Table[T]) DeleteRow(ctx context.Context, row TableRow[T], partKeyValue string) error {
 	if partKeyValue == "" {
-		return errors.New("partition key value must not be empty")
+		return ErrNotFound
 	}
 	partKey := row.getRowPartKeyValue(partKeyValue)
-	sortKeys, err := table.ReadSortKeyValues(ctx, row, partKeyValue, false, 250, "0")
+	sortKeys, err := table.ReadSortKeyValues(ctx, row, partKeyValue, false, 1000, "0")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed reading sort keys to delete row %s from table %s: %w", partKey, table.TableName, err)
 	}
 	for len(sortKeys) > 0 {
 		var requests []types.WriteRequest
 		for _, sortKey := range sortKeys {
 			item := map[string]types.AttributeValue{
-				"v_part": &types.AttributeValueMemberS{Value: partKey},
-				"v_sort": &types.AttributeValueMemberS{Value: sortKey},
+				table.getPartKeyAttr(): &types.AttributeValueMemberS{Value: partKey},
+				table.getSortKeyAttr(): &types.AttributeValueMemberS{Value: sortKey},
 			}
 			request := types.WriteRequest{DeleteRequest: &types.DeleteRequest{Key: item}}
 			requests = append(requests, request)
 		}
 		err := table.writeBatches(ctx, requests)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed deleting row %s from table %s: %w", partKey, table.EntityType, err)
 		}
 		offset := sortKeys[len(sortKeys)-1]
-		sortKeys, err = table.ReadSortKeyValues(ctx, row, partKeyValue, false, 250, offset)
+		sortKeys, err = table.ReadSortKeyValues(ctx, row, partKeyValue, false, 1000, offset)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed reading sort keys to delete row %s from table %s: %w", partKey, table.TableName, err)
 		}
 	}
 	return nil
@@ -550,18 +765,21 @@ func (table Table[T]) DeleteRow(ctx context.Context, row TableRow[T], partKeyVal
 // Note that this method will seldom be used, perhaps for cleaning up obsolete items.
 func (table Table[T]) DeleteItem(ctx context.Context, rowPartKeyValue string, sortKeyValue string) error {
 	if rowPartKeyValue == "" || sortKeyValue == "" {
-		return errors.New("rowPartKeyValue and sortKeyValue must not be empty")
+		return ErrNotFound
 	}
 	item := map[string]types.AttributeValue{
-		"v_part": &types.AttributeValueMemberS{Value: rowPartKeyValue},
-		"v_sort": &types.AttributeValueMemberS{Value: sortKeyValue},
+		table.getPartKeyAttr(): &types.AttributeValueMemberS{Value: rowPartKeyValue},
+		table.getSortKeyAttr(): &types.AttributeValueMemberS{Value: sortKeyValue},
 	}
 	req := dynamodb.DeleteItemInput{
 		TableName: aws.String(table.TableName),
 		Key:       item,
 	}
 	_, err := table.Client.DeleteItem(ctx, &req)
-	return err // usually nil
+	if err != nil {
+		return fmt.Errorf("failed deleting item %s %s from table %s: %w", rowPartKeyValue, sortKeyValue, table.TableName, err)
+	}
+	return nil
 }
 
 // ReadAllPartKeyValues reads all the values of the partition keys used for the specified row.
@@ -590,26 +808,26 @@ func (table Table[T]) ReadAllSortKeyValues(ctx context.Context, row TableRow[T],
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
-			"#p": "v_part",
+			"#p": table.getPartKeyAttr(),
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":p": &types.AttributeValueMemberS{Value: partKey},
 		},
 		KeyConditionExpression: aws.String("#p = :p"),
-		ProjectionExpression:   aws.String("v_sort"),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr()),
 		ScanIndexForward:       aws.Bool(true),
 	}
 	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return keyValues, err
+			return keyValues, fmt.Errorf("failed reading all sort key values for row %s from table %s: %w", partKey, table.TableName, err)
 		}
 		for _, item := range page.Items {
-			if item == nil || item["v_sort"] == nil {
+			if item == nil || item[table.getSortKeyAttr()] == nil {
 				continue
 			}
-			attrValue := item["v_sort"]
+			attrValue := item[table.getSortKeyAttr()]
 			keyValue := attrValue.(*types.AttributeValueMemberS).Value
 			if keyValue != "" {
 				keyValues = append(keyValues, keyValue)
@@ -621,13 +839,13 @@ func (table Table[T]) ReadAllSortKeyValues(ctx context.Context, row TableRow[T],
 
 // ReadSortKeyValues reads paginated sort key values for the specified row and partition key value.
 func (table Table[T]) ReadSortKeyValues(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]string, error) {
-	var keyName string
+	var partKey string
 	if partKeyValue == "" {
 		// Read partition key values
-		keyName = row.getRowPartKey()
+		partKey = row.getRowPartKey()
 	} else {
 		// Read sort key values
-		keyName = row.getRowPartKeyValue(partKeyValue)
+		partKey = row.getRowPartKeyValue(partKeyValue)
 	}
 	if offset == "" {
 		// An empty offset means start from the beginning
@@ -641,27 +859,27 @@ func (table Table[T]) ReadSortKeyValues(ctx context.Context, row TableRow[T], pa
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
-			"#p": "v_part",
-			"#s": "v_sort",
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":p": &types.AttributeValueMemberS{Value: keyName},
+			":p": &types.AttributeValueMemberS{Value: partKey},
 			":s": &types.AttributeValueMemberS{Value: offset},
 		},
 		KeyConditionExpression: aws.String(keyConditionExpression),
-		ProjectionExpression:   aws.String("v_sort"),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr()),
 		ScanIndexForward:       aws.Bool(!reverse),
 		Limit:                  aws.Int32(int32(limit)),
 	}
 	res, err := table.Client.Query(ctx, &req)
 	if err != nil {
-		return keyValues, err
+		return keyValues, fmt.Errorf("failed reading sort key values for row %s from table %s: %w", partKey, table.TableName, err)
 	}
 	for _, item := range res.Items {
-		if item == nil || item["v_sort"] == nil {
+		if item == nil || item[table.getSortKeyAttr()] == nil {
 			continue
 		}
-		attrValue := item["v_sort"]
+		attrValue := item[table.getSortKeyAttr()]
 		keyValue := attrValue.(*types.AttributeValueMemberS).Value
 		if keyValue != "" {
 			keyValues = append(keyValues, keyValue)
@@ -670,24 +888,72 @@ func (table Table[T]) ReadSortKeyValues(ctx context.Context, row TableRow[T], pa
 	return keyValues, nil
 }
 
-// ReadFirstSortKeyID reads the first sort key value for the specified row and partition key value.
+// ReadFirstSortKeyValue reads the first sort key value for the specified row and partition key value.
 // This method is typically used for looking up an ID corresponding to a foreign key.
-func (table Table[T]) ReadFirstSortKeyID(ctx context.Context, row TableRow[T], partKeyValue string) (string, error) {
-	keyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, false, 1, tuid.MinID)
-	if err != nil || len(keyValues) == 0 {
-		return "", err
+func (table Table[T]) ReadFirstSortKeyValue(ctx context.Context, row TableRow[T], partKeyValue string) (string, error) {
+	var partKey string
+	if partKeyValue == "" {
+		// Read partition key values
+		partKey = row.getRowPartKey()
+	} else {
+		// Read sort key values
+		partKey = row.getRowPartKeyValue(partKeyValue)
 	}
-	return keyValues[0], nil
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: partKey},
+		},
+		KeyConditionExpression: aws.String("#p = :p"),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr()),
+		ScanIndexForward:       aws.Bool(true),
+		Limit:                  aws.Int32(1),
+	}
+	res, err := table.Client.Query(ctx, &req)
+	if err != nil {
+		return "", fmt.Errorf("error reading first sort key value for %s: %w", partKey, err)
+	}
+	if len(res.Items) == 0 || res.Items[0][table.getSortKeyAttr()] == nil {
+		return "", ErrNotFound
+	}
+	return res.Items[0][table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value, nil
 }
 
-// ReadLastSortKeyID reads the last sort key value for the specified row and partition key value.
+// ReadLastSortKeyValue reads the last sort key value for the specified row and partition key value.
 // This method is typically used for looking up the current version ID of a versioned entity.
-func (table Table[T]) ReadLastSortKeyID(ctx context.Context, row TableRow[T], partKeyValue string) (string, error) {
-	keyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, true, 1, tuid.MaxID)
-	if err != nil || len(keyValues) == 0 {
-		return "", err
+func (table Table[T]) ReadLastSortKeyValue(ctx context.Context, row TableRow[T], partKeyValue string) (string, error) {
+	var partKey string
+	if partKeyValue == "" {
+		// Read partition key values
+		partKey = row.getRowPartKey()
+	} else {
+		// Read sort key values
+		partKey = row.getRowPartKeyValue(partKeyValue)
 	}
-	return keyValues[0], nil
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: partKey},
+		},
+		KeyConditionExpression: aws.String("#p = :p"),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr()),
+		ScanIndexForward:       aws.Bool(false),
+		Limit:                  aws.Int32(1),
+	}
+	res, err := table.Client.Query(ctx, &req)
+	if err != nil {
+		return "", fmt.Errorf("error reading last sort key value for %s: %w", partKey, err)
+	}
+	if len(res.Items) == 0 || res.Items[0][table.getSortKeyAttr()] == nil {
+		return "", ErrNotFound
+	}
+	return res.Items[0][table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value, nil
 }
 
 // ReadAllEntityIDs reads all entity IDs from the EntityRow.
@@ -714,30 +980,7 @@ func (table Table[T]) ReadEntityVersionIDs(ctx context.Context, entityID string,
 
 // ReadCurrentEntityVersionID reads the current entity version ID for the specified entity.
 func (table Table[T]) ReadCurrentEntityVersionID(ctx context.Context, entityID string) (string, error) {
-	return table.ReadLastSortKeyID(ctx, table.EntityRow, entityID)
-}
-
-// EntityExists checks if an entity exists in the table.
-func (table Table[T]) EntityExists(ctx context.Context, entityID string) bool {
-	versionID, err := table.ReadFirstSortKeyID(ctx, table.EntityRow, entityID)
-	return err == nil && versionID != ""
-}
-
-// EntityVersionExists checks if an entity version exists in the table.
-func (table Table[T]) EntityVersionExists(ctx context.Context, entityID string, versionID string) bool {
-	if entityID == "" || versionID == "" {
-		return false
-	}
-	req := dynamodb.GetItemInput{
-		TableName: aws.String(table.TableName),
-		Key: map[string]types.AttributeValue{
-			"v_part": &types.AttributeValueMemberS{Value: table.EntityRow.getRowPartKeyValue(entityID)},
-			"v_sort": &types.AttributeValueMemberS{Value: versionID},
-		},
-		ProjectionExpression: aws.String("v_part,v_sort"),
-	}
-	res, err := table.Client.GetItem(ctx, &req)
-	return err == nil && res.Item != nil && res.Item["v_part"] != nil && res.Item["v_sort"] != nil
+	return table.ReadLastSortKeyValue(ctx, table.EntityRow, entityID)
 }
 
 // ReadEntities reads the current versions of the specified entities from the EntityRow.
@@ -749,7 +992,7 @@ func (table Table[T]) ReadEntities(ctx context.Context, entityIDs []string) []T 
 	}
 	var batches [][]string
 	maxBatchSize := 10 // concurrent request limit
-	batches = MakeBatches(entityIDs, maxBatchSize)
+	batches = Batch(entityIDs, maxBatchSize)
 	for _, batch := range batches {
 		batchSize := len(batch)
 		results := make(chan T, batchSize)
@@ -759,8 +1002,8 @@ func (table Table[T]) ReadEntities(ctx context.Context, entityIDs []string) []T 
 			go func(entityID string) {
 				defer wg.Done()
 				entity, err := table.ReadEntity(ctx, entityID)
-				if err != nil {
-					// log the problem but continue
+				if err != nil && err != ErrNotFound {
+					log.Printf("failed concurrent read %s-%s: %v\n", table.EntityType, entityID, err)
 				} else {
 					results <- entity
 				}
@@ -786,7 +1029,7 @@ func (table Table[T]) ReadEntitiesAsJSON(ctx context.Context, entityIDs []string
 	var i int
 	var batches [][]string
 	maxBatchSize := 10 // concurrent request limit
-	batches = MakeBatches(entityIDs, maxBatchSize)
+	batches = Batch(entityIDs, maxBatchSize)
 	for _, batch := range batches {
 		batchSize := len(batch)
 		results := make(chan []byte, batchSize)
@@ -796,8 +1039,8 @@ func (table Table[T]) ReadEntitiesAsJSON(ctx context.Context, entityIDs []string
 			go func(entityID string) {
 				defer wg.Done()
 				entity, err := table.ReadEntityAsJSON(ctx, entityID)
-				if err != nil {
-					// log the problem but continue
+				if err != nil && err != ErrNotFound {
+					log.Printf("failed concurrent read as JSON %s-%s: %v\n", table.EntityType, entityID, err)
 				} else {
 					results <- entity
 				}
@@ -819,14 +1062,13 @@ func (table Table[T]) ReadEntitiesAsJSON(ctx context.Context, entityIDs []string
 
 // ReadEntity reads the current version of the specified entity.
 func (table Table[T]) ReadEntity(ctx context.Context, entityID string) (T, error) {
-	var entity T
 	gzJSON, err := table.ReadEntityAsCompressedJSON(ctx, entityID)
 	if err != nil {
-		return entity, err
+		return *new(T), err // e.g. ErrNotFound
 	}
-	err = FromCompressedJSON(gzJSON, &entity)
+	entity, err := FromCompressedJSON[T](gzJSON)
 	if err != nil {
-		return entity, err
+		return entity, fmt.Errorf("failed to read %s-%s: %w", table.EntityType, entityID, err)
 	}
 	return entity, nil
 }
@@ -835,9 +1077,13 @@ func (table Table[T]) ReadEntity(ctx context.Context, entityID string) (T, error
 func (table Table[T]) ReadEntityAsJSON(ctx context.Context, entityID string) ([]byte, error) {
 	gzJSON, err := table.ReadEntityAsCompressedJSON(ctx, entityID)
 	if err != nil {
-		return nil, err
+		return nil, err // e.g. ErrNotFound
 	}
-	return UncompressJSON(gzJSON)
+	j, err := UncompressJSON(gzJSON)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s-%s: %w", table.EntityType, entityID, err)
+	}
+	return j, nil
 }
 
 // ReadEntityAsCompressedJSON reads the current version of the specified entity, returning a compressed JSON byte slice.
@@ -852,24 +1098,24 @@ func (table Table[T]) ReadEntityAsCompressedJSON(ctx context.Context, entityID s
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
-			"#p": "v_part",
+			"#p": table.getPartKeyAttr(),
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":p": &types.AttributeValueMemberS{Value: table.EntityRow.getRowPartKeyValue(entityID)},
 		},
 		KeyConditionExpression: aws.String("#p = :p"),
-		ProjectionExpression:   aws.String("v_json"),
+		ProjectionExpression:   aws.String(table.getJsonValueAttr()),
 		ScanIndexForward:       aws.Bool(false),
 		Limit:                  aws.Int32(1),
 	}
 	res, err := table.Client.Query(ctx, &req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error reading %s-%s: %w", table.EntityType, entityID, err)
 	}
-	if len(res.Items) == 0 || res.Items[0]["v_json"] == nil {
+	if len(res.Items) == 0 || res.Items[0][table.getJsonValueAttr()] == nil {
 		return nil, ErrNotFound
 	}
-	return res.Items[0]["v_json"].(*types.AttributeValueMemberB).Value, nil
+	return res.Items[0][table.getJsonValueAttr()].(*types.AttributeValueMemberB).Value, nil
 }
 
 // ReadEntityVersion reads the specified version of the specified entity.
@@ -906,14 +1152,14 @@ func (table Table[T]) ReadAllEntityVersionsAsJSON(ctx context.Context, entityID 
 
 // ReadEntityFromRow reads the specified entity from the specified row.
 func (table Table[T]) ReadEntityFromRow(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (T, error) {
-	var entity T
 	gzJSON, err := table.ReadEntityFromRowAsCompressedJSON(ctx, row, partKeyValue, sortKeyValue)
 	if err != nil {
-		return entity, err
+		return *new(T), err // e.g. ErrNotFound
 	}
-	err = FromCompressedJSON(gzJSON, &entity)
+	entity, err := FromCompressedJSON[T](gzJSON)
 	if err != nil {
-		return entity, err
+		return entity, fmt.Errorf("error reading %s %s %s: %w",
+			table.EntityType, row.getRowPartKeyValue(partKeyValue), sortKeyValue, err)
 	}
 	return entity, nil
 }
@@ -922,9 +1168,14 @@ func (table Table[T]) ReadEntityFromRow(ctx context.Context, row TableRow[T], pa
 func (table Table[T]) ReadEntityFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) ([]byte, error) {
 	gzJSON, err := table.ReadEntityFromRowAsCompressedJSON(ctx, row, partKeyValue, sortKeyValue)
 	if err != nil {
-		return nil, err
+		return nil, err // e.g. ErrNotFound
 	}
-	return UncompressJSON(gzJSON)
+	j, err := UncompressJSON(gzJSON)
+	if err != nil {
+		return nil, fmt.Errorf("error reading %s %s %s: %w",
+			table.EntityType, row.getRowPartKeyValue(partKeyValue), sortKeyValue, err)
+	}
+	return j, nil
 }
 
 // ReadEntityFromRowAsCompressedJSON reads the specified entity from the specified row as compressed JSON bytes.
@@ -938,19 +1189,20 @@ func (table Table[T]) ReadEntityFromRowAsCompressedJSON(ctx context.Context, row
 	req := dynamodb.GetItemInput{
 		TableName: aws.String(table.TableName),
 		Key: map[string]types.AttributeValue{
-			"v_part": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
-			"v_sort": &types.AttributeValueMemberS{Value: sortKeyValue},
+			table.getPartKeyAttr(): &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
+			table.getSortKeyAttr(): &types.AttributeValueMemberS{Value: sortKeyValue},
 		},
-		ProjectionExpression: aws.String("v_json"),
+		ProjectionExpression: aws.String(table.getJsonValueAttr()),
 	}
 	res, err := table.Client.GetItem(ctx, &req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error reading %s %s %s: %w",
+			table.EntityType, row.getRowPartKeyValue(partKeyValue), sortKeyValue, err)
 	}
-	if res.Item == nil || res.Item["v_json"] == nil {
+	if res.Item == nil || res.Item[table.getJsonValueAttr()] == nil {
 		return nil, ErrNotFound
 	}
-	return res.Item["v_json"].(*types.AttributeValueMemberB).Value, nil
+	return res.Item[table.getJsonValueAttr()].(*types.AttributeValueMemberB).Value, nil
 }
 
 // ReadEntitiesFromRow reads paginated entities from the specified row.
@@ -969,33 +1221,32 @@ func (table Table[T]) ReadEntitiesFromRow(ctx context.Context, row TableRow[T], 
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
-			"#p": "v_part",
-			"#s": "v_sort",
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
 			":s": &types.AttributeValueMemberS{Value: offset},
 		},
 		KeyConditionExpression: aws.String(keyConditionExpression),
-		ProjectionExpression:   aws.String("v_json"),
+		ProjectionExpression:   aws.String(table.getJsonValueAttr()),
 		ScanIndexForward:       aws.Bool(!reverse),
 		Limit:                  aws.Int32(int32(limit)),
 	}
 	res, err := table.Client.Query(ctx, &req)
 	if err != nil {
-		return entities, err
+		return entities, fmt.Errorf("error reading paginated %s %s: %w",
+			table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 	}
 	for _, item := range res.Items {
-		if item == nil || item["v_json"] == nil {
+		if item == nil || item[table.getJsonValueAttr()] == nil {
 			continue
 		}
-		gzJSON := item["v_json"].(*types.AttributeValueMemberB).Value
-		var entity T
-		err = FromCompressedJSON(gzJSON, &entity)
-		if err != nil {
-			return entities, err
+		gzJSON := item[table.getJsonValueAttr()].(*types.AttributeValueMemberB).Value
+		if entity, err := FromCompressedJSON[T](gzJSON); err == nil {
+			// best effort; skip entities with broken JSON
+			entities = append(entities, entity)
 		}
-		entities = append(entities, entity)
 	}
 	return entities, nil
 }
@@ -1006,7 +1257,7 @@ func (table Table[T]) ReadEntitiesFromRowAsJSON(ctx context.Context, row TableRo
 		return nil, errors.New("row " + row.RowName + " must contain compressed JSON values")
 	}
 	if partKeyValue == "" {
-		return nil, nil
+		return []byte("[]"), nil
 	}
 	keyConditionExpression := "#p = :p and #s > :s"
 	if reverse {
@@ -1015,37 +1266,39 @@ func (table Table[T]) ReadEntitiesFromRowAsJSON(ctx context.Context, row TableRo
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
-			"#p": "v_part",
-			"#s": "v_sort",
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
 			":s": &types.AttributeValueMemberS{Value: offset},
 		},
 		KeyConditionExpression: aws.String(keyConditionExpression),
-		ProjectionExpression:   aws.String("v_json"),
+		ProjectionExpression:   aws.String(table.getJsonValueAttr()),
 		ScanIndexForward:       aws.Bool(!reverse),
 		Limit:                  aws.Int32(int32(limit)),
 	}
 	res, err := table.Client.Query(ctx, &req)
 	if err != nil {
-		return nil, err
+		return []byte("[]"), fmt.Errorf("error reading paginated JSON %s %s: %w",
+			table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 	}
+	var i int
 	var buf bytes.Buffer
 	buf.WriteString("[")
-	for i, item := range res.Items {
-		if item == nil || item["v_json"] == nil {
+	for _, item := range res.Items {
+		if item == nil || item[table.getJsonValueAttr()] == nil {
 			continue
 		}
-		gzJSON := item["v_json"].(*types.AttributeValueMemberB).Value
-		jsonBytes, err := UncompressJSON(gzJSON)
-		if err != nil {
-			continue
+		gzJSON := item[table.getJsonValueAttr()].(*types.AttributeValueMemberB).Value
+		if jsonBytes, err := UncompressJSON(gzJSON); err == nil {
+			// best effort; skip entities with broken compressed JSON
+			if i > 0 {
+				buf.WriteString(",")
+			}
+			buf.Write(jsonBytes)
+			i++
 		}
-		if i > 0 {
-			buf.WriteString(",")
-		}
-		buf.Write(jsonBytes)
 	}
 	buf.WriteString("]")
 	return buf.Bytes(), nil
@@ -1064,32 +1317,31 @@ func (table Table[T]) ReadAllEntitiesFromRow(ctx context.Context, row TableRow[T
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
-			"#p": "v_part",
+			"#p": table.getPartKeyAttr(),
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
 		},
 		KeyConditionExpression: aws.String("#p = :p"),
-		ProjectionExpression:   aws.String("v_json"),
+		ProjectionExpression:   aws.String(table.getJsonValueAttr()),
 		ScanIndexForward:       aws.Bool(true),
 	}
 	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return entities, err
+			return entities, fmt.Errorf("error reading all %s %s: %w",
+				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 		}
 		for _, item := range page.Items {
-			if item == nil || item["v_json"] == nil {
+			if item == nil || item[table.getJsonValueAttr()] == nil {
 				continue
 			}
-			gzJSON := item["v_json"].(*types.AttributeValueMemberB).Value
-			var entity T
-			err = FromCompressedJSON(gzJSON, &entity)
-			if err != nil {
-				return entities, err
+			gzJSON := item[table.getJsonValueAttr()].(*types.AttributeValueMemberB).Value
+			if entity, err := FromCompressedJSON[T](gzJSON); err == nil {
+				// best effort; skip entities with broken JSON
+				entities = append(entities, entity)
 			}
-			entities = append(entities, entity)
 		}
 	}
 	return entities, nil
@@ -1102,18 +1354,18 @@ func (table Table[T]) ReadAllEntitiesFromRowAsJSON(ctx context.Context, row Tabl
 		return nil, errors.New("row " + row.RowName + " must contain compressed JSON values")
 	}
 	if partKeyValue == "" {
-		return nil, nil
+		return []byte("[]"), nil
 	}
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
-			"#p": "v_part",
+			"#p": table.getPartKeyAttr(),
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
 		},
 		KeyConditionExpression: aws.String("#p = :p"),
-		ProjectionExpression:   aws.String("v_json"),
+		ProjectionExpression:   aws.String(table.getJsonValueAttr()),
 		ScanIndexForward:       aws.Bool(true),
 	}
 	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
@@ -1123,31 +1375,131 @@ func (table Table[T]) ReadAllEntitiesFromRowAsJSON(ctx context.Context, row Tabl
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, err
+			return []byte("[]"), fmt.Errorf("error reading all JSON %s %s: %w",
+				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 		}
 		for _, item := range page.Items {
-			if item == nil || item["v_json"] == nil {
+			if item == nil || item[table.getJsonValueAttr()] == nil {
 				continue
 			}
-			gzJSON := item["v_json"].(*types.AttributeValueMemberB).Value
-			jsonBytes, err := UncompressJSON(gzJSON)
-			if err != nil {
-				continue
+			gzJSON := item[table.getJsonValueAttr()].(*types.AttributeValueMemberB).Value
+			if jsonBytes, err := UncompressJSON(gzJSON); err == nil {
+				// best effort; skip entities with broken compressed JSON
+				if comma {
+					buf.WriteString(",")
+				}
+				buf.Write(jsonBytes)
+				comma = true
 			}
-			if comma {
-				buf.WriteString(",\n")
-			}
-			buf.Write(jsonBytes)
-			comma = true
 		}
 	}
 	buf.WriteString("]")
 	return buf.Bytes(), nil
 }
 
+// ReadRecord reads the specified record from the provided table row.
+func (table Table[T]) ReadRecord(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (Record, error) {
+	if partKeyValue == "" || sortKeyValue == "" {
+		return Record{}, ErrNotFound
+	}
+	attributes := strings.Join(table.getAttributeNames(), ", ")
+	req := dynamodb.GetItemInput{
+		TableName: aws.String(table.TableName),
+		Key: map[string]types.AttributeValue{
+			table.getPartKeyAttr(): &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
+			table.getSortKeyAttr(): &types.AttributeValueMemberS{Value: sortKeyValue},
+		},
+		ProjectionExpression: aws.String(attributes),
+	}
+	res, err := table.Client.GetItem(ctx, &req)
+	if err != nil {
+		return Record{}, fmt.Errorf("error reading record %s %s %s: %w",
+			table.EntityType, row.getRowPartKeyValue(partKeyValue), sortKeyValue, err)
+	}
+	if len(res.Item) == 0 {
+		return Record{}, ErrNotFound
+	}
+	return table.itemToRecord(res.Item), nil
+}
+
+// ReadRecords reads paginated Records from the specified row.
+func (table Table[T]) ReadRecords(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]Record, error) {
+	records := make([]Record, 0)
+	if partKeyValue == "" {
+		return records, nil
+	}
+	keyConditionExpression := "#p = :p and #s > :s"
+	if reverse {
+		keyConditionExpression = "#p = :p and #s < :s"
+	}
+	attributes := strings.Join(table.getAttributeNames(), ", ")
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
+			":s": &types.AttributeValueMemberS{Value: offset},
+		},
+		KeyConditionExpression: aws.String(keyConditionExpression),
+		ProjectionExpression:   aws.String(attributes),
+		ScanIndexForward:       aws.Bool(!reverse),
+		Limit:                  aws.Int32(int32(limit)),
+	}
+	res, err := table.Client.Query(ctx, &req)
+	if err != nil {
+		return records, fmt.Errorf("error reading paginated records %s %s: %w",
+			table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
+	}
+	for _, item := range res.Items {
+		if len(item) > 0 {
+			records = append(records, table.itemToRecord(item))
+		}
+	}
+	return records, nil
+}
+
+// ReadAllRecords reads all Records from the specified row.
+// Note: this can return a very large number of values! Use with caution.
+func (table Table[T]) ReadAllRecords(ctx context.Context, row TableRow[T], partKeyValue string) ([]Record, error) {
+	records := make([]Record, 0)
+	if partKeyValue == "" {
+		return records, nil
+	}
+	attributes := strings.Join(table.getAttributeNames(), ", ")
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
+		},
+		KeyConditionExpression: aws.String("#p = :p"),
+		ProjectionExpression:   aws.String(attributes),
+		ScanIndexForward:       aws.Bool(true),
+	}
+	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return records, fmt.Errorf("error reading all records %s %s: %w",
+				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
+		}
+		for _, item := range page.Items {
+			if len(item) > 0 {
+				records = append(records, table.itemToRecord(item))
+			}
+		}
+	}
+	return records, nil
+}
+
 // ReadTextValue reads the specified text value from the specified row.
 func (table Table[T]) ReadTextValue(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (TextValue, error) {
-	var textValue TextValue
+	textValue := TextValue{Key: sortKeyValue, Value: ""}
 	if row.TextValue == nil {
 		return textValue, errors.New("row " + row.RowName + " must contain text values")
 	}
@@ -1157,20 +1509,21 @@ func (table Table[T]) ReadTextValue(ctx context.Context, row TableRow[T], partKe
 	req := dynamodb.GetItemInput{
 		TableName: aws.String(table.TableName),
 		Key: map[string]types.AttributeValue{
-			"v_part": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
-			"v_sort": &types.AttributeValueMemberS{Value: sortKeyValue},
+			table.getPartKeyAttr(): &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
+			table.getSortKeyAttr(): &types.AttributeValueMemberS{Value: sortKeyValue},
 		},
-		ProjectionExpression: aws.String("v_sort, v_text"),
+		ProjectionExpression: aws.String(table.getSortKeyAttr() + ", " + table.getTextValueAttr()),
 	}
 	res, err := table.Client.GetItem(ctx, &req)
 	if err != nil {
-		return textValue, err
+		return textValue, fmt.Errorf("error reading text value %s %s %s: %w",
+			table.EntityType, row.getRowPartKeyValue(partKeyValue), sortKeyValue, err)
 	}
-	if res.Item == nil || res.Item["v_sort"] == nil || res.Item["v_text"] == nil {
+	if res.Item == nil || res.Item[table.getSortKeyAttr()] == nil || res.Item[table.getTextValueAttr()] == nil {
 		return textValue, ErrNotFound
 	}
-	textValue.Key = res.Item["v_sort"].(*types.AttributeValueMemberS).Value
-	textValue.Value = res.Item["v_text"].(*types.AttributeValueMemberS).Value
+	textValue.Key = res.Item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value
+	textValue.Value = res.Item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
 	return textValue, nil
 }
 
@@ -1190,29 +1543,30 @@ func (table Table[T]) ReadTextValues(ctx context.Context, row TableRow[T], partK
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
-			"#p": "v_part",
-			"#s": "v_sort",
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
 			":s": &types.AttributeValueMemberS{Value: offset},
 		},
 		KeyConditionExpression: aws.String(keyConditionExpression),
-		ProjectionExpression:   aws.String("v_sort, v_text"),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr() + ", " + table.getTextValueAttr()),
 		ScanIndexForward:       aws.Bool(!reverse),
 		Limit:                  aws.Int32(int32(limit)),
 	}
 	res, err := table.Client.Query(ctx, &req)
 	if err != nil {
-		return textValues, err
+		return textValues, fmt.Errorf("error reading paginated text values %s %s: %w",
+			table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 	}
 	for _, item := range res.Items {
-		if item == nil || item["v_sort"] == nil || item["v_text"] == nil {
-			continue
+		if item != nil && item[table.getSortKeyAttr()] != nil && item[table.getTextValueAttr()] != nil {
+			textValues = append(textValues, TextValue{
+				Key:   item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value,
+				Value: item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value,
+			})
 		}
-		key := item["v_sort"].(*types.AttributeValueMemberS).Value
-		value := item["v_text"].(*types.AttributeValueMemberS).Value
-		textValues = append(textValues, TextValue{Key: key, Value: value})
 	}
 	return textValues, nil
 }
@@ -1230,28 +1584,29 @@ func (table Table[T]) ReadAllTextValues(ctx context.Context, row TableRow[T], pa
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
-			"#p": "v_part",
+			"#p": table.getPartKeyAttr(),
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
 		},
 		KeyConditionExpression: aws.String("#p = :p"),
-		ProjectionExpression:   aws.String("v_sort, v_text"),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr() + ", " + table.getTextValueAttr()),
 		ScanIndexForward:       aws.Bool(true),
 	}
 	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return textValues, err
+			return textValues, fmt.Errorf("error reading all text values %s %s: %w",
+				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 		}
 		for _, item := range page.Items {
-			if item == nil || item["v_sort"] == nil || item["v_text"] == nil {
-				continue
+			if item != nil && item[table.getSortKeyAttr()] != nil && item[table.getTextValueAttr()] != nil {
+				textValues = append(textValues, TextValue{
+					Key:   item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value,
+					Value: item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value,
+				})
 			}
-			key := item["v_sort"].(*types.AttributeValueMemberS).Value
-			value := item["v_text"].(*types.AttributeValueMemberS).Value
-			textValues = append(textValues, TextValue{Key: key, Value: value})
 		}
 	}
 	if sortByValue {
@@ -1264,7 +1619,7 @@ func (table Table[T]) ReadAllTextValues(ctx context.Context, row TableRow[T], pa
 
 // ReadNumericValue reads the specified numeric value from the specified row.
 func (table Table[T]) ReadNumericValue(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (NumValue, error) {
-	var numValue NumValue
+	numValue := NumValue{Key: sortKeyValue, Value: 0}
 	if row.NumericValue == nil {
 		return numValue, errors.New("row " + row.RowName + " must contain numeric values")
 	}
@@ -1274,20 +1629,21 @@ func (table Table[T]) ReadNumericValue(ctx context.Context, row TableRow[T], par
 	req := dynamodb.GetItemInput{
 		TableName: aws.String(table.TableName),
 		Key: map[string]types.AttributeValue{
-			"v_part": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
-			"v_sort": &types.AttributeValueMemberS{Value: sortKeyValue},
+			table.getPartKeyAttr(): &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
+			table.getSortKeyAttr(): &types.AttributeValueMemberS{Value: sortKeyValue},
 		},
-		ProjectionExpression: aws.String("v_sort, v_num"),
+		ProjectionExpression: aws.String(table.getSortKeyAttr() + ", " + table.getNumericValueAttr()),
 	}
 	res, err := table.Client.GetItem(ctx, &req)
 	if err != nil {
-		return numValue, err
+		return numValue, fmt.Errorf("error reading numeric value %s %s %s: %w",
+			table.EntityType, row.getRowPartKeyValue(partKeyValue), sortKeyValue, err)
 	}
-	if res.Item == nil || res.Item["v_sort"] == nil || res.Item["v_num"] == nil {
+	if res.Item == nil || res.Item[table.getSortKeyAttr()] == nil || res.Item[table.getNumericValueAttr()] == nil {
 		return numValue, ErrNotFound
 	}
-	numValue.Key = res.Item["v_sort"].(*types.AttributeValueMemberS).Value
-	numValue.Value, _ = strconv.ParseFloat(res.Item["v_num"].(*types.AttributeValueMemberN).Value, 64)
+	numValue.Key = res.Item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value
+	numValue.Value, _ = strconv.ParseFloat(res.Item[table.getNumericValueAttr()].(*types.AttributeValueMemberN).Value, 64)
 	return numValue, nil
 }
 
@@ -1307,29 +1663,29 @@ func (table Table[T]) ReadNumericValues(ctx context.Context, row TableRow[T], pa
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
-			"#p": "v_part",
-			"#s": "v_sort",
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
 			":s": &types.AttributeValueMemberS{Value: offset},
 		},
 		KeyConditionExpression: aws.String(keyConditionExpression),
-		ProjectionExpression:   aws.String("v_sort, v_num"),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr() + ", " + table.getNumericValueAttr()),
 		ScanIndexForward:       aws.Bool(!reverse),
 		Limit:                  aws.Int32(int32(limit)),
 	}
 	res, err := table.Client.Query(ctx, &req)
 	if err != nil {
-		return numValues, err
+		return numValues, fmt.Errorf("error reading paginated numeric values %s %s: %w",
+			table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 	}
 	for _, item := range res.Items {
-		if item == nil || item["v_sort"] == nil || item["v_num"] == nil {
-			continue
+		if item != nil && item[table.getSortKeyAttr()] != nil && item[table.getNumericValueAttr()] != nil {
+			key := item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value
+			value, _ := strconv.ParseFloat(item[table.getNumericValueAttr()].(*types.AttributeValueMemberN).Value, 64)
+			numValues = append(numValues, NumValue{Key: key, Value: value})
 		}
-		key := item["v_sort"].(*types.AttributeValueMemberS).Value
-		value, _ := strconv.ParseFloat(item["v_num"].(*types.AttributeValueMemberN).Value, 64)
-		numValues = append(numValues, NumValue{Key: key, Value: value})
 	}
 	return numValues, nil
 }
@@ -1347,28 +1703,28 @@ func (table Table[T]) ReadAllNumericValues(ctx context.Context, row TableRow[T],
 	req := dynamodb.QueryInput{
 		TableName: aws.String(table.TableName),
 		ExpressionAttributeNames: map[string]string{
-			"#p": "v_part",
+			"#p": table.getPartKeyAttr(),
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
 		},
 		KeyConditionExpression: aws.String("#p = :p"),
-		ProjectionExpression:   aws.String("v_sort, v_num"),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr() + ", " + table.getNumericValueAttr()),
 		ScanIndexForward:       aws.Bool(true),
 	}
 	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return numValues, err
+			return numValues, fmt.Errorf("error reading all numeric values %s %s: %w",
+				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 		}
 		for _, item := range page.Items {
-			if item == nil || item["v_sort"] == nil || item["v_num"] == nil {
-				continue
+			if item != nil && item[table.getSortKeyAttr()] != nil && item[table.getNumericValueAttr()] != nil {
+				key := item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value
+				value, _ := strconv.ParseFloat(item[table.getNumericValueAttr()].(*types.AttributeValueMemberN).Value, 64)
+				numValues = append(numValues, NumValue{Key: key, Value: value})
 			}
-			key := item["v_sort"].(*types.AttributeValueMemberS).Value
-			value, _ := strconv.ParseFloat(item["v_num"].(*types.AttributeValueMemberN).Value, 64)
-			numValues = append(numValues, NumValue{Key: key, Value: value})
 		}
 	}
 	if sortByValue {
