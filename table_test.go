@@ -259,7 +259,7 @@ func TestTable_EntityVersionExists(t *testing.T) {
 
 func TestTable_ReadEntities(t *testing.T) {
 	ids := []string{v11.ID, v20.ID}
-	var entities []VersionableThing = tableReader.ReadEntities(ctx, ids)
+	var entities = tableReader.ReadEntities(ctx, ids)
 	if len(entities) != 2 {
 		t.Fatalf("expected 2 entities, got %d", len(entities))
 	}
