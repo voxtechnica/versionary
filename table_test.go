@@ -278,6 +278,27 @@ func TestTable_ReadEntities(t *testing.T) {
 	}
 }
 
+func TestTable_ReadEntities_missing(t *testing.T) {
+	ids := []string{v11.ID, "not found", v20.ID}
+	var entities = tableReader.ReadEntities(ctx, ids)
+	if len(entities) != 2 {
+		t.Fatalf("expected 2 entities, got %d", len(entities))
+	}
+	for _, e := range entities {
+		if v11.ID == e.ID {
+			if !reflect.DeepEqual(v11, e) {
+				t.Errorf("v11 and e are not equal")
+			}
+		} else if v20.ID == e.ID {
+			if !reflect.DeepEqual(v20, e) {
+				t.Errorf("v20 and e are not equal")
+			}
+		} else {
+			t.Errorf("unexpected entity ID: %s", e.ID)
+		}
+	}
+}
+
 func TestTable_ReadEntitiesAsJSON(t *testing.T) {
 	ids := []string{v11.ID, v20.ID}
 	jsonBytes := tableReader.ReadEntitiesAsJSON(ctx, ids)
@@ -290,6 +311,24 @@ func TestTable_ReadEntitiesAsJSON(t *testing.T) {
 	}
 	if !strings.Contains(jsonString, v20.ID) {
 		t.Errorf("expected JSON string to contain entity ID %s, got %s", v20.ID, jsonString)
+	}
+}
+
+func TestTable_ReadEntitiesAsJSON_missing(t *testing.T) {
+	ids := []string{v11.ID, "not found", v20.ID}
+	jsonBytes := tableReader.ReadEntitiesAsJSON(ctx, ids)
+	if len(jsonBytes) == 0 {
+		t.Fatalf("expected JSON bytes, got %d", len(jsonBytes))
+	}
+	jsonString := string(jsonBytes)
+	if !strings.Contains(jsonString, v11.ID) {
+		t.Errorf("expected JSON string to contain entity ID %s, got %s", v11.ID, jsonString)
+	}
+	if !strings.Contains(jsonString, v20.ID) {
+		t.Errorf("expected JSON string to contain entity ID %s, got %s", v20.ID, jsonString)
+	}
+	if strings.Contains(jsonString, ",,") || strings.Contains(jsonString, "[,") || strings.Contains(jsonString, ",]") {
+		t.Errorf("missing id produced malformed json with ',,' or '[,' or ',] %s", jsonString)
 	}
 }
 

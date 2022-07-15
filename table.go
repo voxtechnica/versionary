@@ -986,16 +986,20 @@ func (table Table[T]) ReadCurrentEntityVersionID(ctx context.Context, entityID s
 // ReadEntities reads the current versions of the specified entities from the EntityRow.
 // If an entity does not exist, it will be omitted from the results.
 func (table Table[T]) ReadEntities(ctx context.Context, entityIDs []string) []T {
-	entities := make([]T, 0)
+	entities := make([]T, 0, len(entityIDs))
 	if len(entityIDs) == 0 {
 		return entities
 	}
+	entityIndex := make(map[string]T, len(entityIDs))
 	var batches [][]string
 	maxBatchSize := 10 // concurrent request limit
 	batches = Batch(entityIDs, maxBatchSize)
 	for _, batch := range batches {
 		batchSize := len(batch)
-		results := make(chan T, batchSize)
+		results := make(chan struct {
+			ID     string
+			entity T
+		}, batchSize)
 		var wg sync.WaitGroup
 		wg.Add(batchSize)
 		for _, entityID := range batch {
@@ -1004,15 +1008,23 @@ func (table Table[T]) ReadEntities(ctx context.Context, entityIDs []string) []T 
 				entity, err := table.ReadEntity(ctx, entityID)
 				if err != nil && err != ErrNotFound {
 					log.Printf("failed concurrent read %s-%s: %v\n", table.EntityType, entityID, err)
-				} else {
-					results <- entity
+				} else if err != ErrNotFound {
+					results <- struct {
+						ID     string
+						entity T
+					}{ID: entityID, entity: entity}
 				}
 			}(entityID)
 		}
 		wg.Wait()
 		close(results)
 		for entity := range results {
-			entities = append(entities, entity)
+			entityIndex[entity.ID] = entity.entity
+		}
+	}
+	for _, id := range entityIDs {
+		if val, ok := entityIndex[id]; ok {
+			entities = append(entities, val)
 		}
 	}
 	return entities
@@ -1024,15 +1036,16 @@ func (table Table[T]) ReadEntitiesAsJSON(ctx context.Context, entityIDs []string
 	if len(entityIDs) == 0 {
 		return nil
 	}
-	var entities bytes.Buffer
-	entities.WriteString("[")
-	var i int
+	entityIndex := make(map[string][]byte, len(entityIDs))
 	var batches [][]string
 	maxBatchSize := 10 // concurrent request limit
 	batches = Batch(entityIDs, maxBatchSize)
 	for _, batch := range batches {
 		batchSize := len(batch)
-		results := make(chan []byte, batchSize)
+		results := make(chan struct {
+			ID     string
+			entity []byte
+		}, batchSize)
 		var wg sync.WaitGroup
 		wg.Add(batchSize)
 		for _, entityID := range batch {
@@ -1041,18 +1054,28 @@ func (table Table[T]) ReadEntitiesAsJSON(ctx context.Context, entityIDs []string
 				entity, err := table.ReadEntityAsJSON(ctx, entityID)
 				if err != nil && err != ErrNotFound {
 					log.Printf("failed concurrent read as JSON %s-%s: %v\n", table.EntityType, entityID, err)
-				} else {
-					results <- entity
+				} else if err != ErrNotFound {
+					results <- struct {
+						ID     string
+						entity []byte
+					}{ID: entityID, entity: entity}
 				}
 			}(entityID)
 		}
 		wg.Wait()
 		close(results)
 		for entity := range results {
+			entityIndex[entity.ID] = entity.entity
+		}
+	}
+	var entities bytes.Buffer
+	entities.WriteString("[")
+	for i, id := range entityIDs {
+		if val, ok := entityIndex[id]; ok {
 			if i > 0 {
 				entities.WriteString(",")
 			}
-			entities.Write(entity)
+			entities.Write(val)
 			i++
 		}
 	}
