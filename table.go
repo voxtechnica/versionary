@@ -1036,8 +1036,7 @@ func (table Table[T]) ReadEntitiesAsJSON(ctx context.Context, entityIDs []string
 	if len(entityIDs) == 0 {
 		return nil
 	}
-	entities := make([]string, 0, len(entityIDs))
-	entityIndex := make(map[string]string, len(entityIDs))
+	entityIndex := make(map[string][]byte, len(entityIDs))
 	var batches [][]string
 	maxBatchSize := 10 // concurrent request limit
 	batches = Batch(entityIDs, maxBatchSize)
@@ -1045,7 +1044,7 @@ func (table Table[T]) ReadEntitiesAsJSON(ctx context.Context, entityIDs []string
 		batchSize := len(batch)
 		results := make(chan struct {
 			ID     string
-			entity string
+			entity []byte
 		}, batchSize)
 		var wg sync.WaitGroup
 		wg.Add(batchSize)
@@ -1058,8 +1057,8 @@ func (table Table[T]) ReadEntitiesAsJSON(ctx context.Context, entityIDs []string
 				} else if err != ErrNotFound {
 					results <- struct {
 						ID     string
-						entity string
-					}{ID: entityID, entity: string(entity)}
+						entity []byte
+					}{ID: entityID, entity: entity}
 				}
 			}(entityID)
 		}
@@ -1069,12 +1068,19 @@ func (table Table[T]) ReadEntitiesAsJSON(ctx context.Context, entityIDs []string
 			entityIndex[entity.ID] = entity.entity
 		}
 	}
-	for _, id := range entityIDs {
+	var entities bytes.Buffer
+	entities.WriteString("[")
+	for i, id := range entityIDs {
 		if val, ok := entityIndex[id]; ok {
-			entities = append(entities, val)
+			if i > 0 {
+				entities.WriteString(",")
+			}
+			entities.Write(val)
+			i++
 		}
 	}
-	return []byte("[" + strings.Join(entities, ",") + "]")
+	entities.WriteString("]")
+	return entities.Bytes()
 }
 
 // ReadEntity reads the current version of the specified entity.
