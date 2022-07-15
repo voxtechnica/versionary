@@ -1012,7 +1012,7 @@ func (table Table[T]) ReadEntities(ctx context.Context, entityIDs []string) []T 
 					results <- struct {
 						ID     string
 						entity T
-					}{entityID, entity}
+					}{ID: entityID, entity: entity}
 				}
 			}(entityID)
 		}
