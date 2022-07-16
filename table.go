@@ -1070,7 +1070,8 @@ func (table Table[T]) ReadEntitiesAsJSON(ctx context.Context, entityIDs []string
 	}
 	var entities bytes.Buffer
 	entities.WriteString("[")
-	for i, id := range entityIDs {
+	var i int
+	for _, id := range entityIDs {
 		if val, ok := entityIndex[id]; ok {
 			if i > 0 {
 				entities.WriteString(",")
