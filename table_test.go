@@ -14,16 +14,15 @@ import (
 )
 
 var (
-	ctx         context.Context
-	tableReader TableReader[VersionableThing]
-	v10         VersionableThing
-	v11         VersionableThing
-	v20         VersionableThing
+	testTable TableReadWriter[versionableThing]
+	ctx       = context.Background()
+	v10       = newVersionableThing("zyx v1.0", 3, []string{"tag1", "tag2"})
+	v11       = updatedVersionableThing(v10, "zyx v1.1", 2, []string{"tag1", "tag3"})
+	v20       = newVersionableThing("abc v2.0", 1, []string{"tag1", "tag2"})
 )
 
 func TestMain(m *testing.M) {
 	// Set up DynamoDB Client
-	ctx = context.Background()
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		fmt.Printf("unable to load SDK config, %v\n", err)
@@ -32,7 +31,7 @@ func TestMain(m *testing.M) {
 	dbClient := dynamodb.NewFromConfig(cfg)
 
 	// Set up Entity Table, creating it if needed
-	table := NewThingTable(dbClient, "test")
+	table := newThingTable(dbClient, "test")
 	if !table.IsValid() {
 		fmt.Println("invalid DynamoDB table definition", table.TableName)
 		os.Exit(1)
@@ -50,33 +49,38 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// Set up Versionable Things
-	v10 = CreateVersionableThing("zyx v1.0", 3, []string{"tag1", "tag2"})
-	v11 = UpdateVersionableThing(v10, "zyx v1.1", 2, []string{"tag1", "tag3"})
-	v20 = CreateVersionableThing("abc v2.0", 1, []string{"tag1", "tag2"})
-
 	// Run all the TableReader tests
 	fmt.Println("Running the in-memory TableReader tests ...")
-	InitTestDatabase(ctx, memTable)
-	tableReader = memTable
+	initTestDatabase(ctx, memTable)
+	testTable = memTable
 	exitVal := m.Run()
 	if exitVal != 0 {
 		os.Exit(exitVal)
 	}
 
 	fmt.Println("Running the DynamoDB TableReader tests ...")
-	InitTestDatabase(ctx, table)
-	tableReader = table
+	initTestDatabase(ctx, table)
+	testTable = table
 	exitVal = m.Run()
 
 	// Delete an entity
 	err = table.DeleteEntity(ctx, v20)
 	if err != nil {
-		fmt.Printf("v2.0 DynamoDB delete failed: %v\n", err)
+		fmt.Printf("DynamoDB: v2.0 delete failed: %v\n", err)
 	}
 	err = memTable.DeleteEntity(ctx, v20)
 	if err != nil {
-		fmt.Printf("v2.0 MemTable delete failed: %v\n", err)
+		fmt.Printf("MemTable: v2.0 delete failed: %v\n", err)
+	}
+
+	// Delete an entity version
+	err = deleteEntityVersion(table)
+	if err != nil {
+		fmt.Printf("DynamoDB: %v\n", err)
+	}
+	err = deleteEntityVersion(memTable)
+	if err != nil {
+		fmt.Printf("MemTable: %v\n", err)
 	}
 
 	// Delete the temporary testing table if it exists
@@ -89,12 +93,49 @@ func TestMain(m *testing.M) {
 	os.Exit(exitVal)
 }
 
+// deleteEntityVersion tests an entity version deletion for the specified table
+func deleteEntityVersion(tbl TableReadWriter[versionableThing]) error {
+	// Delete the current version
+	v11Deleted, err := tbl.DeleteEntityVersionWithID(ctx, v11.ID, v11.UpdateID)
+	if err != nil {
+		return fmt.Errorf("v1.1 delete version failed: %v", err)
+	}
+	// Expect the result to be the deleted version
+	if v11Deleted.Message != v11.Message {
+		return fmt.Errorf("v1.1 delete version failed: expected %s, got %s", v11.Message, v11Deleted.Message)
+	}
+	// Expect the new current version to be the previous version
+	v10Current, err := tbl.ReadEntity(ctx, v11.ID)
+	if err != nil {
+		return fmt.Errorf("v1.1 delete version read current failed: %v", err)
+	}
+	if v10Current.Message != v10.Message {
+		return fmt.Errorf("v1.1 delete version read current failed: expected %s, got %s", v10.Message, v10Current.Message)
+	}
+	// Expect the index row to be rolled back to the previous version
+	row, ok := tbl.GetRow("messages_tag")
+	if !ok {
+		return fmt.Errorf("v1.1 delete version failed: row messages_tag not found")
+	}
+	values, err := tbl.ReadAllTextValues(ctx, row, "tag2", true)
+	if err != nil {
+		return fmt.Errorf("v1.1 delete version read text values failed: %v", err)
+	}
+	if len(values) < 1 {
+		return fmt.Errorf("v1.1 delete version read text values failed: expected value(s), got %d", len(values))
+	}
+	if values[len(values)-1].Value != v10.Message {
+		return fmt.Errorf("v1.1 delete version read text values failed: expected %s, got %s", v10.Message, values[len(values)-1].Value)
+	}
+	return nil
+}
+
 func TestJSON(t *testing.T) {
 	j, err := ToJSON(v10)
 	if err != nil {
 		t.Fatalf("ToJSON failed: %v", err)
 	}
-	v10check, err := FromJSON[VersionableThing](j)
+	v10check, err := FromJSON[versionableThing](j)
 	if err != nil {
 		t.Errorf("FromJSON failed: %v", err)
 	} else if !reflect.DeepEqual(v10, v10check) {
@@ -107,7 +148,7 @@ func TestCompressedJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToCompressedJSON failed: %v", err)
 	}
-	v11Check, err := FromCompressedJSON[VersionableThing](gzJSON)
+	v11Check, err := FromCompressedJSON[versionableThing](gzJSON)
 	if err != nil {
 		t.Errorf("FromCompressedJSON failed: %v", err)
 	} else if !reflect.DeepEqual(v11, v11Check) {
@@ -116,7 +157,7 @@ func TestCompressedJSON(t *testing.T) {
 }
 
 func TestTableRow_GetPartKeyValues(t *testing.T) {
-	row, ok := tableReader.GetRow("messages_tag")
+	row, ok := testTable.GetRow("messages_tag")
 	if !ok {
 		t.Fatalf("messages_tag row not found")
 	}
@@ -145,15 +186,23 @@ func TestTableRow_GetPartKeyValues(t *testing.T) {
 
 func TestTable_ReadPartKeyValues(t *testing.T) {
 	// Read all the entity IDs from the table
-	ids, err := tableReader.ReadAllPartKeyValues(ctx, tableReader.GetEntityRow())
+	ids, err := testTable.ReadAllPartKeyValues(ctx, testTable.GetEntityRow())
 	if err != nil {
 		t.Fatalf("ReadAllPartKeyValues failed: %v", err)
 	} else if len(ids) == 0 {
 		t.Fatalf("expected entity ID(s), got %d", len(ids))
 	}
 
+	// Count the number of entities in the table
+	count, err := testTable.CountPartKeyValues(ctx, testTable.GetEntityRow())
+	if err != nil {
+		t.Errorf("CountPartKeyValues failed: %v", err)
+	} else if count != int64(len(ids)) {
+		t.Errorf("expected entity count, got %d", count)
+	}
+
 	// Read paginated entity IDs from the table (forward sort order)
-	page, err := tableReader.ReadPartKeyValues(ctx, tableReader.GetEntityRow(), false, 1, tuid.MinID)
+	page, err := testTable.ReadPartKeyValues(ctx, testTable.GetEntityRow(), false, 1, tuid.MinID)
 	if err != nil {
 		t.Errorf("ReadPartKeyValues failed: %v", err)
 	} else if len(page) == 0 {
@@ -163,7 +212,7 @@ func TestTable_ReadPartKeyValues(t *testing.T) {
 	}
 
 	// Read paginated entity IDs from the table (reverse sort order)
-	page, err = tableReader.ReadPartKeyValues(ctx, tableReader.GetEntityRow(), true, 1, tuid.MaxID)
+	page, err = testTable.ReadPartKeyValues(ctx, testTable.GetEntityRow(), true, 1, tuid.MaxID)
 	if err != nil {
 		t.Errorf("ReadPartKeyValues failed: %v", err)
 	} else if len(page) == 0 {
@@ -175,7 +224,7 @@ func TestTable_ReadPartKeyValues(t *testing.T) {
 
 func TestTable_ReadSortKeyValues(t *testing.T) {
 	// Read all sort key values from the table row
-	row, ok := tableReader.GetRow("things_day")
+	row, ok := testTable.GetRow("things_day")
 	if !ok {
 		t.Fatalf("things_day row not found")
 	}
@@ -183,15 +232,23 @@ func TestTable_ReadSortKeyValues(t *testing.T) {
 		t.Fatalf("things_day row is not valid")
 	}
 	partKeyValue := row.PartKeyValue(v10)
-	sortKeyValues, err := tableReader.ReadAllSortKeyValues(ctx, row, partKeyValue)
+	sortKeyValues, err := testTable.ReadAllSortKeyValues(ctx, row, partKeyValue)
 	if err != nil {
 		t.Fatalf("ReadAllSortKeyValues failed: %v", err)
 	} else if len(sortKeyValues) < 2 {
 		t.Fatalf("expected 2 sort key value(s), got %d", len(sortKeyValues))
 	}
 
+	// Count the number of sort key values in the table row
+	count, err := testTable.CountSortKeyValues(ctx, row, partKeyValue)
+	if err != nil {
+		t.Errorf("CountSortKeyValues failed: %v", err)
+	} else if count != int64(len(sortKeyValues)) {
+		t.Errorf("expected sort key value count, got %d", count)
+	}
+
 	// Read paginated sort key values from the table row (forward sort order)
-	page, err := tableReader.ReadSortKeyValues(ctx, row, partKeyValue, false, 1, tuid.MinID)
+	page, err := testTable.ReadSortKeyValues(ctx, row, partKeyValue, false, 1, tuid.MinID)
 	if err != nil {
 		t.Errorf("ReadSortKeyValues failed: %v", err)
 	} else if len(page) == 0 {
@@ -201,7 +258,7 @@ func TestTable_ReadSortKeyValues(t *testing.T) {
 	}
 
 	// Read paginated sort key values from the table row (reverse sort order)
-	page, err = tableReader.ReadSortKeyValues(ctx, row, partKeyValue, true, 1, tuid.MaxID)
+	page, err = testTable.ReadSortKeyValues(ctx, row, partKeyValue, true, 1, tuid.MaxID)
 	if err != nil {
 		t.Errorf("ReadSortKeyValues failed: %v", err)
 	} else if len(page) == 0 {
@@ -211,7 +268,7 @@ func TestTable_ReadSortKeyValues(t *testing.T) {
 	}
 
 	// Read the first sort key value from the table row
-	sortKeyValue, err := tableReader.ReadFirstSortKeyValue(ctx, row, partKeyValue)
+	sortKeyValue, err := testTable.ReadFirstSortKeyValue(ctx, row, partKeyValue)
 	if err != nil {
 		t.Errorf("ReadFirstSortKeyValue failed: %v", err)
 	} else if sortKeyValue != sortKeyValues[0] {
@@ -219,7 +276,7 @@ func TestTable_ReadSortKeyValues(t *testing.T) {
 	}
 
 	// Read the last sort key value from the table row
-	sortKeyValue, err = tableReader.ReadLastSortKeyValue(ctx, row, partKeyValue)
+	sortKeyValue, err = testTable.ReadLastSortKeyValue(ctx, row, partKeyValue)
 	if err != nil {
 		t.Errorf("ReadLastSortKeyValue failed: %v", err)
 	} else if sortKeyValue != sortKeyValues[len(sortKeyValues)-1] {
@@ -229,14 +286,14 @@ func TestTable_ReadSortKeyValues(t *testing.T) {
 
 func TestTable_EntityExists(t *testing.T) {
 	// Check if an entity exists
-	exists := tableReader.EntityExists(ctx, v10.ID)
+	exists := testTable.EntityExists(ctx, v10.ID)
 	if !exists {
 		t.Errorf("expected entity %s to exist", v10.ID)
 	}
 
 	// Check if an entity does not exist
 	id := tuid.NewID()
-	exists = tableReader.EntityExists(ctx, id.String())
+	exists = testTable.EntityExists(ctx, id.String())
 	if exists {
 		t.Errorf("expected entity %s to not exist", id)
 	}
@@ -244,14 +301,14 @@ func TestTable_EntityExists(t *testing.T) {
 
 func TestTable_EntityVersionExists(t *testing.T) {
 	// Check if an entity version exists
-	exists := tableReader.EntityVersionExists(ctx, v10.ID, v10.UpdateID)
+	exists := testTable.EntityVersionExists(ctx, v10.ID, v10.UpdateID)
 	if !exists {
 		t.Errorf("expected entity %s version %s to exist", v10.ID, v10.UpdateID)
 	}
 
 	// Check if an entity version does not exist
 	id := tuid.NewID()
-	exists = tableReader.EntityVersionExists(ctx, id.String(), v10.UpdateID)
+	exists = testTable.EntityVersionExists(ctx, id.String(), v10.UpdateID)
 	if exists {
 		t.Errorf("expected entity %s version %s to not exist", id, v10.UpdateID)
 	}
@@ -259,7 +316,7 @@ func TestTable_EntityVersionExists(t *testing.T) {
 
 func TestTable_ReadEntities(t *testing.T) {
 	ids := []string{v11.ID, v20.ID}
-	var entities = tableReader.ReadEntities(ctx, ids)
+	var entities = testTable.ReadEntities(ctx, ids)
 	if len(entities) != 2 {
 		t.Fatalf("expected 2 entities, got %d", len(entities))
 	}
@@ -280,7 +337,7 @@ func TestTable_ReadEntities(t *testing.T) {
 
 func TestTable_ReadEntities_missing(t *testing.T) {
 	ids := []string{v11.ID, "not found", v20.ID}
-	var entities = tableReader.ReadEntities(ctx, ids)
+	var entities = testTable.ReadEntities(ctx, ids)
 	if len(entities) != 2 {
 		t.Fatalf("expected 2 entities, got %d", len(entities))
 	}
@@ -301,7 +358,7 @@ func TestTable_ReadEntities_missing(t *testing.T) {
 
 func TestTable_ReadEntitiesAsJSON(t *testing.T) {
 	ids := []string{v11.ID, v20.ID}
-	jsonBytes := tableReader.ReadEntitiesAsJSON(ctx, ids)
+	jsonBytes := testTable.ReadEntitiesAsJSON(ctx, ids)
 	if len(jsonBytes) == 0 {
 		t.Fatalf("expected JSON bytes, got %d", len(jsonBytes))
 	}
@@ -316,7 +373,7 @@ func TestTable_ReadEntitiesAsJSON(t *testing.T) {
 
 func TestTable_ReadEntitiesAsJSON_missing(t *testing.T) {
 	ids := []string{v11.ID, "not found", v20.ID}
-	jsonBytes := tableReader.ReadEntitiesAsJSON(ctx, ids)
+	jsonBytes := testTable.ReadEntitiesAsJSON(ctx, ids)
 	if len(jsonBytes) == 0 {
 		t.Fatalf("expected JSON bytes, got %d", len(jsonBytes))
 	}
@@ -334,19 +391,19 @@ func TestTable_ReadEntitiesAsJSON_missing(t *testing.T) {
 
 func TestTable_ReadEntity(t *testing.T) {
 	// Read the current version of an entity
-	v11Check, err := tableReader.ReadEntity(ctx, v11.ID)
+	v11Check, err := testTable.ReadEntity(ctx, v11.ID)
 	if err != nil {
 		t.Errorf("ReadEntity failed: %v", err)
 	} else if !reflect.DeepEqual(v11, v11Check) {
 		t.Errorf("v11 and v11Check are not equal")
 	}
 	// Read an entity that does not exist
-	_, err = tableReader.ReadEntity(ctx, "does-not-exist")
+	_, err = testTable.ReadEntity(ctx, "does-not-exist")
 	if err == nil {
 		t.Errorf("expected an error, got nil")
 	}
 	// Read an entity as JSON
-	jsonBytes, err := tableReader.ReadEntityAsJSON(ctx, v11.ID)
+	jsonBytes, err := testTable.ReadEntityAsJSON(ctx, v11.ID)
 	if err != nil {
 		t.Errorf("ReadEntityAsJSON failed: %v", err)
 	} else if !strings.Contains(string(jsonBytes), v11.ID) {
@@ -355,7 +412,7 @@ func TestTable_ReadEntity(t *testing.T) {
 }
 
 func TestTable_ReadEntityVersion(t *testing.T) {
-	v10Check, err := tableReader.ReadEntityVersion(ctx, v10.ID, v10.UpdateID)
+	v10Check, err := testTable.ReadEntityVersion(ctx, v10.ID, v10.UpdateID)
 	if err != nil {
 		t.Errorf("ReadEntityVersion failed: %v", err)
 	} else if !reflect.DeepEqual(v10, v10Check) {
@@ -365,8 +422,8 @@ func TestTable_ReadEntityVersion(t *testing.T) {
 
 func TestTable_ReadEntityVersions(t *testing.T) {
 	// Read all entity versions
-	var versions []VersionableThing
-	versions, err := tableReader.ReadAllEntityVersions(ctx, v10.ID)
+	var versions []versionableThing
+	versions, err := testTable.ReadAllEntityVersions(ctx, v10.ID)
 	if err != nil {
 		t.Fatalf("ReadAllEntityVersions failed: %v", err)
 	} else if len(versions) == 0 {
@@ -374,8 +431,8 @@ func TestTable_ReadEntityVersions(t *testing.T) {
 	}
 
 	// Read paginated entity versions (forward sort order)
-	var page []VersionableThing
-	page, err = tableReader.ReadEntityVersions(ctx, v10.ID, false, 1, tuid.MinID)
+	var page []versionableThing
+	page, err = testTable.ReadEntityVersions(ctx, v10.ID, false, 1, tuid.MinID)
 	if err != nil {
 		t.Errorf("ReadEntityVersions failed: %v", err)
 	} else if len(page) == 0 {
@@ -385,7 +442,7 @@ func TestTable_ReadEntityVersions(t *testing.T) {
 	}
 
 	// Read paginated entity versions (reverse sort order)
-	page, err = tableReader.ReadEntityVersions(ctx, v10.ID, true, 1, tuid.MaxID)
+	page, err = testTable.ReadEntityVersions(ctx, v10.ID, true, 1, tuid.MaxID)
 	if err != nil {
 		t.Errorf("ReadEntityVersions failed: %v", err)
 	} else if len(page) == 0 {
@@ -396,7 +453,7 @@ func TestTable_ReadEntityVersions(t *testing.T) {
 }
 
 func TestTable_ReadEntityFromRow(t *testing.T) {
-	row, ok := tableReader.GetRow("things_day")
+	row, ok := testTable.GetRow("things_day")
 	if !ok {
 		t.Fatalf("things_day row not found")
 	}
@@ -405,7 +462,7 @@ func TestTable_ReadEntityFromRow(t *testing.T) {
 	}
 	partKeyValue := row.PartKeyValue(v20)
 	sortKeyValue := row.SortKeyValue(v20)
-	v20Check, err := tableReader.ReadEntityFromRow(ctx, row, partKeyValue, sortKeyValue)
+	v20Check, err := testTable.ReadEntityFromRow(ctx, row, partKeyValue, sortKeyValue)
 	if err != nil {
 		t.Errorf("ReadEntityFromRow failed: %v", err)
 	} else if !reflect.DeepEqual(v20, v20Check) {
@@ -414,7 +471,7 @@ func TestTable_ReadEntityFromRow(t *testing.T) {
 }
 
 func TestTable_ReadEntitiesFromRow(t *testing.T) {
-	row, ok := tableReader.GetRow("things_day")
+	row, ok := testTable.GetRow("things_day")
 	if !ok {
 		t.Fatalf("things_day row not found")
 	}
@@ -422,8 +479,8 @@ func TestTable_ReadEntitiesFromRow(t *testing.T) {
 		t.Fatalf("things_day row is invalid")
 	}
 	day := row.PartKeyValue(v11)
-	var entities []VersionableThing
-	entities, err := tableReader.ReadAllEntitiesFromRow(ctx, row, day)
+	var entities []versionableThing
+	entities, err := testTable.ReadAllEntitiesFromRow(ctx, row, day)
 	if err != nil {
 		t.Fatalf("ReadAllEntitiesFromRow failed: %v", err)
 	} else if len(entities) < 2 {
@@ -437,7 +494,7 @@ func TestTable_ReadEntitiesFromRow(t *testing.T) {
 	}
 
 	// Read paginated entities (forward sort order)
-	entities, err = tableReader.ReadEntitiesFromRow(ctx, row, day, false, 1, tuid.MinID)
+	entities, err = testTable.ReadEntitiesFromRow(ctx, row, day, false, 1, tuid.MinID)
 	if err != nil {
 		t.Errorf("ReadEntitiesFromRow failed: %v", err)
 	} else if len(entities) == 0 {
@@ -447,7 +504,7 @@ func TestTable_ReadEntitiesFromRow(t *testing.T) {
 	}
 
 	// Read paginated entities (reverse sort order)
-	entities, err = tableReader.ReadEntitiesFromRow(ctx, row, day, true, 1, tuid.MaxID)
+	entities, err = testTable.ReadEntitiesFromRow(ctx, row, day, true, 1, tuid.MaxID)
 	if err != nil {
 		t.Errorf("ReadEntitiesFromRow failed: %v", err)
 	} else if len(entities) == 0 {
@@ -458,7 +515,7 @@ func TestTable_ReadEntitiesFromRow(t *testing.T) {
 }
 
 func TestTable_ReadEntitiesFromRowAsJSON(t *testing.T) {
-	row, ok := tableReader.GetRow("things_day")
+	row, ok := testTable.GetRow("things_day")
 	if !ok {
 		t.Fatalf("things_day row not found")
 	}
@@ -466,7 +523,7 @@ func TestTable_ReadEntitiesFromRowAsJSON(t *testing.T) {
 		t.Fatalf("things_day row is invalid")
 	}
 	day := row.PartKeyValue(v11)
-	jsonBytes, err := tableReader.ReadAllEntitiesFromRowAsJSON(ctx, row, day)
+	jsonBytes, err := testTable.ReadAllEntitiesFromRowAsJSON(ctx, row, day)
 	if err != nil {
 		t.Fatalf("ReadAllEntitiesFromRowAsJSON failed: %v", err)
 	} else if len(jsonBytes) == 0 {
@@ -482,7 +539,7 @@ func TestTable_ReadEntitiesFromRowAsJSON(t *testing.T) {
 }
 
 func TestTable_ReadRecord(t *testing.T) {
-	row, ok := tableReader.GetRow("messages_tag")
+	row, ok := testTable.GetRow("messages_tag")
 	if !ok {
 		t.Fatalf("messages_tag row not found")
 	}
@@ -491,7 +548,7 @@ func TestTable_ReadRecord(t *testing.T) {
 	}
 
 	// Read an expected Record
-	record, err := tableReader.ReadRecord(ctx, row, "tag1", v11.ID)
+	record, err := testTable.ReadRecord(ctx, row, "tag1", v11.ID)
 	if err != nil {
 		t.Fatalf("ReadRecord failed: %v", err)
 	}
@@ -515,7 +572,7 @@ func TestTable_ReadRecord(t *testing.T) {
 	}
 
 	// Read a non-existent Record
-	record, err = tableReader.ReadRecord(ctx, row, "tag2", v11.ID)
+	record, err = testTable.ReadRecord(ctx, row, "tag2", v11.ID)
 	if err == nil {
 		t.Fatalf("expected ReadRecord not found, received: %v", record)
 	} else if !strings.Contains(err.Error(), "not found") {
@@ -524,7 +581,7 @@ func TestTable_ReadRecord(t *testing.T) {
 }
 
 func TestTable_ReadRecords(t *testing.T) {
-	row, ok := tableReader.GetRow("messages_tag")
+	row, ok := testTable.GetRow("messages_tag")
 	if !ok {
 		t.Fatalf("messages_tag row not found")
 	}
@@ -535,7 +592,7 @@ func TestTable_ReadRecords(t *testing.T) {
 
 	// Read all Records, sorted by key
 	var records []Record
-	records, err := tableReader.ReadAllRecords(ctx, row, tag)
+	records, err := testTable.ReadAllRecords(ctx, row, tag)
 	if err != nil {
 		t.Fatalf("ReadAllRecords failed: %v", err)
 	} else if len(records) < 2 {
@@ -543,7 +600,7 @@ func TestTable_ReadRecords(t *testing.T) {
 	}
 
 	// Read paginated Records (forward sort order)
-	records, err = tableReader.ReadRecords(ctx, row, tag, false, 1, tuid.MinID)
+	records, err = testTable.ReadRecords(ctx, row, tag, false, 1, tuid.MinID)
 	if err != nil {
 		t.Fatalf("ReadRecords failed: %v", err)
 	} else if len(records) == 0 {
@@ -553,7 +610,7 @@ func TestTable_ReadRecords(t *testing.T) {
 	}
 
 	// Read paginated Records (reverse sort order)
-	records, err = tableReader.ReadRecords(ctx, row, tag, true, 1, tuid.MaxID)
+	records, err = testTable.ReadRecords(ctx, row, tag, true, 1, tuid.MaxID)
 	if err != nil {
 		t.Fatalf("ReadRecords failed: %v", err)
 	} else if len(records) == 0 {
@@ -564,7 +621,7 @@ func TestTable_ReadRecords(t *testing.T) {
 }
 
 func TestTable_ReadTextValue(t *testing.T) {
-	row, ok := tableReader.GetRow("messages_tag")
+	row, ok := testTable.GetRow("messages_tag")
 	if !ok {
 		t.Fatalf("messages_tag row not found")
 	}
@@ -573,7 +630,7 @@ func TestTable_ReadTextValue(t *testing.T) {
 	}
 
 	// Read an expected text value
-	textValue, err := tableReader.ReadTextValue(ctx, row, "tag1", v11.ID)
+	textValue, err := testTable.ReadTextValue(ctx, row, "tag1", v11.ID)
 	if err != nil {
 		t.Fatalf("ReadTextValue failed: %v", err)
 	}
@@ -585,7 +642,7 @@ func TestTable_ReadTextValue(t *testing.T) {
 	}
 
 	// Read a non-existent text value
-	textValue, err = tableReader.ReadTextValue(ctx, row, "tag2", v11.ID)
+	textValue, err = testTable.ReadTextValue(ctx, row, "tag2", v11.ID)
 	if err == nil {
 		t.Fatalf("expected ReadTextValue not found, received: %v", textValue)
 	} else if !strings.Contains(err.Error(), "not found") {
@@ -594,7 +651,7 @@ func TestTable_ReadTextValue(t *testing.T) {
 }
 
 func TestTable_ReadTextValues(t *testing.T) {
-	row, ok := tableReader.GetRow("messages_tag")
+	row, ok := testTable.GetRow("messages_tag")
 	if !ok {
 		t.Fatalf("messages_tag row not found")
 	}
@@ -605,7 +662,7 @@ func TestTable_ReadTextValues(t *testing.T) {
 
 	// Read all text values, sorted by key
 	var textValues []TextValue
-	textValues, err := tableReader.ReadAllTextValues(ctx, row, tag, false)
+	textValues, err := testTable.ReadAllTextValues(ctx, row, tag, false)
 	if err != nil {
 		t.Fatalf("ReadAllTextValues failed: %v", err)
 	} else if len(textValues) < 2 {
@@ -619,7 +676,7 @@ func TestTable_ReadTextValues(t *testing.T) {
 	}
 
 	// Read all text values, sorted by value
-	textValues, err = tableReader.ReadAllTextValues(ctx, row, tag, true)
+	textValues, err = testTable.ReadAllTextValues(ctx, row, tag, true)
 	if err != nil {
 		t.Fatalf("ReadAllTextValues failed: %v", err)
 	} else if len(textValues) < 2 {
@@ -632,8 +689,29 @@ func TestTable_ReadTextValues(t *testing.T) {
 		t.Errorf("v11 and textValues[1] are not equal")
 	}
 
+	// Filter text values (contains any term)
+	terms := []string{"zyx", "v2"}
+	textValues, err = testTable.FilterTextValues(ctx, row, tag, func(tv TextValue) bool {
+		return tv.ContainsAny(terms)
+	})
+	if err != nil {
+		t.Errorf("FilterTextValues failed: %v", err)
+	} else if len(textValues) != 2 {
+		t.Errorf("expected 2 text values, got %d", len(textValues))
+	}
+
+	// Filter text values (contains all terms)
+	textValues, err = testTable.FilterTextValues(ctx, row, tag, func(tv TextValue) bool {
+		return tv.ContainsAll(terms)
+	})
+	if err != nil {
+		t.Errorf("FilterTextValues failed: %v", err)
+	} else if len(textValues) != 0 {
+		t.Errorf("expected 0 text values, got %d", len(textValues))
+	}
+
 	// Read paginated text values (forward sort order)
-	textValues, err = tableReader.ReadTextValues(ctx, row, tag, false, 1, tuid.MinID)
+	textValues, err = testTable.ReadTextValues(ctx, row, tag, false, 1, tuid.MinID)
 	if err != nil {
 		t.Errorf("ReadTextValues failed: %v", err)
 	} else if len(textValues) == 0 {
@@ -643,7 +721,7 @@ func TestTable_ReadTextValues(t *testing.T) {
 	}
 
 	// Read paginated text values (reverse sort order)
-	textValues, err = tableReader.ReadTextValues(ctx, row, tag, true, 1, tuid.MaxID)
+	textValues, err = testTable.ReadTextValues(ctx, row, tag, true, 1, tuid.MaxID)
 	if err != nil {
 		t.Errorf("ReadTextValues failed: %v", err)
 	} else if len(textValues) == 0 {
@@ -652,7 +730,7 @@ func TestTable_ReadTextValues(t *testing.T) {
 }
 
 func TestTable_ReadNumericValue(t *testing.T) {
-	row, ok := tableReader.GetRow("messages_tag")
+	row, ok := testTable.GetRow("messages_tag")
 	if !ok {
 		t.Fatalf("messages_tag row not found")
 	}
@@ -661,7 +739,7 @@ func TestTable_ReadNumericValue(t *testing.T) {
 	}
 
 	// Read an expected numeric value
-	numValue, err := tableReader.ReadNumericValue(ctx, row, "tag1", v11.ID)
+	numValue, err := testTable.ReadNumericValue(ctx, row, "tag1", v11.ID)
 	if err != nil {
 		t.Fatalf("ReadNumericValue failed: %v", err)
 	}
@@ -673,7 +751,7 @@ func TestTable_ReadNumericValue(t *testing.T) {
 	}
 
 	// Read a non-existent numeric value
-	numValue, err = tableReader.ReadNumericValue(ctx, row, "tag2", v11.ID)
+	numValue, err = testTable.ReadNumericValue(ctx, row, "tag2", v11.ID)
 	if err == nil {
 		t.Fatalf("expected ReadNumericValue not found, received: %v", numValue)
 	} else if !strings.Contains(err.Error(), "not found") {
@@ -682,7 +760,7 @@ func TestTable_ReadNumericValue(t *testing.T) {
 }
 
 func TestTable_ReadNumericValues(t *testing.T) {
-	row, ok := tableReader.GetRow("messages_tag")
+	row, ok := testTable.GetRow("messages_tag")
 	if !ok {
 		t.Fatalf("messages_tag row not found")
 	}
@@ -693,7 +771,7 @@ func TestTable_ReadNumericValues(t *testing.T) {
 
 	// Read all numeric values, sorted by key
 	var numValues []NumValue
-	numValues, err := tableReader.ReadAllNumericValues(ctx, row, tag, false)
+	numValues, err := testTable.ReadAllNumericValues(ctx, row, tag, false)
 	if err != nil {
 		t.Fatalf("ReadAllNumericValues failed: %v", err)
 	} else if len(numValues) < 2 {
@@ -707,7 +785,7 @@ func TestTable_ReadNumericValues(t *testing.T) {
 	}
 
 	// Read all numeric values, sorted by value
-	numValues, err = tableReader.ReadAllNumericValues(ctx, row, tag, true)
+	numValues, err = testTable.ReadAllNumericValues(ctx, row, tag, true)
 	if err != nil {
 		t.Fatalf("ReadAllNumericValues failed: %v", err)
 	} else if len(numValues) < 2 {
@@ -721,7 +799,7 @@ func TestTable_ReadNumericValues(t *testing.T) {
 	}
 
 	// Read paginated numeric values (forward sort order)
-	numValues, err = tableReader.ReadNumericValues(ctx, row, tag, false, 1, tuid.MinID)
+	numValues, err = testTable.ReadNumericValues(ctx, row, tag, false, 1, tuid.MinID)
 	if err != nil {
 		t.Errorf("ReadNumericValues failed: %v", err)
 	} else if len(numValues) == 0 {
@@ -731,7 +809,7 @@ func TestTable_ReadNumericValues(t *testing.T) {
 	}
 
 	// Read paginated numeric values (reverse sort order)
-	numValues, err = tableReader.ReadNumericValues(ctx, row, tag, true, 1, tuid.MaxID)
+	numValues, err = testTable.ReadNumericValues(ctx, row, tag, true, 1, tuid.MaxID)
 	if err != nil {
 		t.Errorf("ReadNumericValues failed: %v", err)
 	} else if len(numValues) == 0 {
@@ -742,7 +820,7 @@ func TestTable_ReadNumericValues(t *testing.T) {
 }
 
 // Initialize the test database with sample data
-func InitTestDatabase(ctx context.Context, writer TableWriter[VersionableThing]) {
+func initTestDatabase(ctx context.Context, writer TableWriter[versionableThing]) {
 	// Write initial versions of the test data
 	err := writer.WriteEntity(ctx, v10)
 	if err != nil {
@@ -763,9 +841,9 @@ func InitTestDatabase(ctx context.Context, writer TableWriter[VersionableThing])
 	}
 }
 
-// VersionableThing is a simple entity that can be versioned (it has an ID and an UpdateID).
+// versionableThing is a simple entity that can be versioned (it has an ID and an UpdateID).
 // It is used for testing entity Table functionality.
-type VersionableThing struct {
+type versionableThing struct {
 	ID        string    `json:"id"`
 	UpdateID  string    `json:"updateId"`
 	CreatedAt time.Time `json:"createdAt"`
@@ -778,7 +856,7 @@ type VersionableThing struct {
 
 // CreatedOn returns an ISO-8601 formatted string date from the CreatedAt timestamp.
 // It is used for testing entity Table functionality (grouping things by date).
-func (v VersionableThing) CreatedOn() string {
+func (v versionableThing) CreatedOn() string {
 	if v.CreatedAt.IsZero() {
 		return ""
 	}
@@ -787,24 +865,24 @@ func (v VersionableThing) CreatedOn() string {
 
 // UpdatedOn returns an ISO-8601 formatted string date from the UpdatedAt timestamp.
 // It is used for testing entity Table functionality (grouping things by date).
-func (v VersionableThing) UpdatedOn() string {
+func (v versionableThing) UpdatedOn() string {
 	if v.UpdatedAt.IsZero() {
 		return ""
 	}
 	return v.UpdatedAt.Format("2006-01-02")
 }
 
-// CompressedJSON returns a compressed JSON representation of the VersionableThing.
-func (v VersionableThing) CompressedJSON() []byte {
+// CompressedJSON returns a compressed JSON representation of the versionableThing.
+func (v versionableThing) CompressedJSON() []byte {
 	gzJSON, _ := ToCompressedJSON(v)
 	return gzJSON
 }
 
-// CreateVersionableThing creates a new VersionableThing with a new ID and UpdateID based on the current system time.
-func CreateVersionableThing(msg string, count int, tags []string) VersionableThing {
+// newVersionableThing creates a new versionableThing with a new ID and UpdateID based on the current system time.
+func newVersionableThing(msg string, count int, tags []string) versionableThing {
 	id := tuid.NewID()
 	createdAt, _ := id.Time()
-	return VersionableThing{
+	return versionableThing{
 		ID:        id.String(),
 		UpdateID:  id.String(),
 		CreatedAt: createdAt,
@@ -816,11 +894,11 @@ func CreateVersionableThing(msg string, count int, tags []string) VersionableThi
 	}
 }
 
-// UpdateVersionableThing updates the message of a VersionableThing, along with it's UpdateID and UpdatedAt timestamp.
-func UpdateVersionableThing(v VersionableThing, msg string, count int, tags []string) VersionableThing {
+// updatedVersionableThing updates the message of a versionableThing, along with it's UpdateID and UpdatedAt timestamp.
+func updatedVersionableThing(v versionableThing, msg string, count int, tags []string) versionableThing {
 	updateID := tuid.NewID()
 	updatedAt, _ := updateID.Time()
-	return VersionableThing{
+	return versionableThing{
 		ID:        v.ID,
 		UpdateID:  updateID.String(),
 		CreatedAt: v.CreatedAt,
@@ -832,54 +910,54 @@ func UpdateVersionableThing(v VersionableThing, msg string, count int, tags []st
 	}
 }
 
-// NewThingTable constructs a new Table definition for VersionableThings, complete with TableRow definitions.
-func NewThingTable(dbClient *dynamodb.Client, env string) Table[VersionableThing] {
+// newThingTable constructs a new Table definition for VersionableThings, complete with TableRow definitions.
+func newThingTable(dbClient *dynamodb.Client, env string) Table[versionableThing] {
 
 	// TableRow: entity versions, partitioned by ID and ordered by UpdateID
-	thingsVersion := TableRow[VersionableThing]{
+	thingsVersion := TableRow[versionableThing]{
 		RowName:       "things_version",
 		PartKeyName:   "id",
-		PartKeyValue:  func(v VersionableThing) string { return v.ID },
+		PartKeyValue:  func(v versionableThing) string { return v.ID },
 		PartKeyValues: nil,
 		SortKeyName:   "update_id",
-		SortKeyValue:  func(v VersionableThing) string { return v.UpdateID },
-		JsonValue:     func(v VersionableThing) []byte { return v.CompressedJSON() },
+		SortKeyValue:  func(v versionableThing) string { return v.UpdateID },
+		JsonValue:     func(v versionableThing) []byte { return v.CompressedJSON() },
 		TextValue:     nil,
 		NumericValue:  nil,
-		TimeToLive:    func(v VersionableThing) int64 { return v.ExpiresAt.Unix() },
+		TimeToLive:    func(v versionableThing) int64 { return v.ExpiresAt.Unix() },
 	}
 
 	// TableRow: things by day, partitioned by CreatedOn date and ordered by ID
-	thingsDay := TableRow[VersionableThing]{
+	thingsDay := TableRow[versionableThing]{
 		RowName:       "things_day",
 		PartKeyName:   "day",
-		PartKeyValue:  func(v VersionableThing) string { return v.CreatedOn() },
+		PartKeyValue:  func(v versionableThing) string { return v.CreatedOn() },
 		PartKeyValues: nil,
 		SortKeyName:   "id",
-		SortKeyValue:  func(v VersionableThing) string { return v.ID },
-		JsonValue:     func(v VersionableThing) []byte { return v.CompressedJSON() },
+		SortKeyValue:  func(v versionableThing) string { return v.ID },
+		JsonValue:     func(v versionableThing) []byte { return v.CompressedJSON() },
 		TextValue:     nil,
 		NumericValue:  nil,
-		TimeToLive:    func(v VersionableThing) int64 { return v.ExpiresAt.Unix() },
+		TimeToLive:    func(v versionableThing) int64 { return v.ExpiresAt.Unix() },
 	}
 
 	// TableRow: messages by topic, partitioned by Topic and ordered by ID
-	messagesTag := TableRow[VersionableThing]{
+	messagesTag := TableRow[versionableThing]{
 		RowName:       "messages_tag",
 		PartKeyName:   "tag",
 		PartKeyValue:  nil,
-		PartKeyValues: func(v VersionableThing) []string { return v.Tags },
+		PartKeyValues: func(v versionableThing) []string { return v.Tags },
 		SortKeyName:   "id",
-		SortKeyValue:  func(v VersionableThing) string { return v.ID },
+		SortKeyValue:  func(v versionableThing) string { return v.ID },
 		JsonValue:     nil,
-		TextValue:     func(v VersionableThing) string { return v.Message },
-		NumericValue:  func(v VersionableThing) float64 { return float64(v.Count) },
-		TimeToLive:    func(v VersionableThing) int64 { return v.ExpiresAt.Unix() },
+		TextValue:     func(v versionableThing) string { return v.Message },
+		NumericValue:  func(v versionableThing) float64 { return float64(v.Count) },
+		TimeToLive:    func(v versionableThing) int64 { return v.ExpiresAt.Unix() },
 	}
 
-	return Table[VersionableThing]{
+	return Table[versionableThing]{
 		Client:           dbClient,
-		EntityType:       "VersionableThing",
+		EntityType:       "versionableThing",
 		TableName:        "versionable_things_" + env,
 		PartKeyAttr:      "part_key",
 		SortKeyAttr:      "sort_key",
@@ -889,7 +967,7 @@ func NewThingTable(dbClient *dynamodb.Client, env string) Table[VersionableThing
 		TimeToLiveAttr:   "expires_at",
 		TTL:              true,
 		EntityRow:        thingsVersion,
-		IndexRows: map[string]TableRow[VersionableThing]{
+		IndexRows: map[string]TableRow[versionableThing]{
 			thingsDay.RowName:   thingsDay,
 			messagesTag.RowName: messagesTag,
 		},

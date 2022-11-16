@@ -2,12 +2,37 @@ package versionary
 
 import (
 	"sort"
+	"strings"
 )
 
 // TextValue represents a key-value pair where the value is a string.
 type TextValue struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+}
+
+// ContainsAny returns true if the Value contains any of the terms (an OR filter).
+// The terms should be lowercase for a case-insensitive search.
+func (tv TextValue) ContainsAny(terms []string) bool {
+	v := strings.ToLower(tv.Value)
+	for _, t := range terms {
+		if strings.Contains(v, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// ContainsAll returns true if the Value contains all the terms (an AND filter).
+// The terms should be lowercase for a case-insensitive search.
+func (tv TextValue) ContainsAll(terms []string) bool {
+	v := strings.ToLower(tv.Value)
+	for _, t := range terms {
+		if !strings.Contains(v, t) {
+			return false
+		}
+	}
+	return true
 }
 
 // NumValue represents a key-value pair where the value is a number.
@@ -79,6 +104,14 @@ func (rs *RecordSet) GetRecords(partKey string, sortKeys []string) []Record {
 		}
 	}
 	return records
+}
+
+// CountSortKeys returns the total number of sort keys for a specified partition key.
+func (rs *RecordSet) CountSortKeys(partKey string) int64 {
+	if *rs == nil || (*rs)[partKey] == nil {
+		return 0
+	}
+	return int64(len((*rs)[partKey]))
 }
 
 // GetSortKeys returns a complete list of sort keys for a specified partition key.

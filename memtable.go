@@ -49,6 +49,16 @@ func (table MemTable[T]) TableExists() bool {
 	return table.Records != nil
 }
 
+// GetEntityType returns the name of the entity type for the MemTable.
+func (table MemTable[T]) GetEntityType() string {
+	return table.EntityType
+}
+
+// GetTableName returns the name of the table.
+func (table MemTable[T]) GetTableName() string {
+	return table.TableName
+}
+
 // GetRow returns the specified row definition.
 func (table MemTable[T]) GetRow(rowName string) (TableRow[T], bool) {
 	if rowName == table.EntityRow.RowName {
@@ -200,6 +210,55 @@ func (table MemTable[T]) DeleteEntityWithID(ctx context.Context, entityID string
 	return entity, table.DeleteEntity(ctx, entity)
 }
 
+// DeleteEntityVersionWithID deletes the specified version of the entity from the table.
+func (table MemTable[T]) DeleteEntityVersionWithID(ctx context.Context, entityID, versionID string) (T, error) {
+	// Does the entity version exist?
+	entity, err := table.ReadEntityVersion(ctx, entityID, versionID)
+	if err == ErrNotFound {
+		return entity, err
+	} else if err != nil {
+		return entity, fmt.Errorf("failed read version to delete %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+	}
+	// If the specified version is the current version, then we need to update the index rows.
+	currentVersionID, err := table.ReadCurrentEntityVersionID(ctx, entityID)
+	if err != nil {
+		return entity, fmt.Errorf("failed read current version ID to delete %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+	}
+	if currentVersionID == versionID {
+		// It's the current version. Is there a previous version?
+		var versionIDs []string
+		versionIDs, err = table.ReadEntityVersionIDs(ctx, entityID, true, 1, currentVersionID)
+		if err != nil {
+			return entity, fmt.Errorf("failed read previous version ID to delete %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+		}
+		// If there is no previous version, just delete the entity
+		if len(versionIDs) == 0 {
+			err = table.DeleteEntity(ctx, entity)
+			if err != nil {
+				return entity, fmt.Errorf("failed to delete entity %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+			}
+			return entity, nil
+		}
+		// Update the entity index rows to the previous version
+		var previousVersion T
+		previousVersion, err = table.ReadEntityVersion(ctx, entityID, versionIDs[0])
+		if err != nil {
+			return entity, fmt.Errorf("failed read previous version to delete %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+		}
+		err = table.UpdateEntityVersion(ctx, entity, previousVersion)
+		if err != nil {
+			return entity, fmt.Errorf("failed update previous version to delete %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+		}
+	}
+	// Delete the specified version of the entity
+	partKey := table.EntityRow.getRowPartKeyValue(entityID)
+	err = table.DeleteItem(ctx, partKey, versionID)
+	if err != nil {
+		return entity, fmt.Errorf("failed to delete %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+	}
+	return entity, nil
+}
+
 // DeleteRow deletes the row for the specified partition key value.
 func (table MemTable[T]) DeleteRow(ctx context.Context, row TableRow[T], partKeyValue string) error {
 	if partKeyValue == "" {
@@ -226,6 +285,11 @@ func (table MemTable[T]) DeleteItem(ctx context.Context, rowPartKeyValue string,
 	return nil
 }
 
+// CountPartKeyValues counts the total number of partition key values for the specified row.
+func (table MemTable[T]) CountPartKeyValues(ctx context.Context, row TableRow[T]) (int64, error) {
+	return table.CountSortKeyValues(ctx, row, "")
+}
+
 // ReadAllPartKeyValues reads all the values of the partition keys used for the specified row.
 // Note that for some rows, this may be a very large number of values.
 func (table MemTable[T]) ReadAllPartKeyValues(ctx context.Context, row TableRow[T]) ([]string, error) {
@@ -235,6 +299,22 @@ func (table MemTable[T]) ReadAllPartKeyValues(ctx context.Context, row TableRow[
 // ReadPartKeyValues reads paginated partition key values for the specified row.
 func (table MemTable[T]) ReadPartKeyValues(ctx context.Context, row TableRow[T], reverse bool, limit int, offset string) ([]string, error) {
 	return table.ReadSortKeyValues(ctx, row, "", reverse, limit, offset)
+}
+
+// CountSortKeyValues counts the total number of sort key values for the specified row and partition key.
+func (table MemTable[T]) CountSortKeyValues(ctx context.Context, row TableRow[T], partKeyValue string) (int64, error) {
+	var partKey string
+	if partKeyValue == "" {
+		// Read partition key values
+		partKey = row.getRowPartKey()
+	} else {
+		// Read sort key values
+		partKey = row.getRowPartKeyValue(partKeyValue)
+	}
+	if table.Records == nil {
+		table.Records = &RecordSet{}
+	}
+	return table.Records.CountSortKeys(partKey), nil
 }
 
 // ReadAllSortKeyValues reads all the sort key values for the specified row and partition key value.
@@ -265,8 +345,11 @@ func (table MemTable[T]) ReadSortKeyValues(ctx context.Context, row TableRow[T],
 		partKey = row.getRowPartKeyValue(partKeyValue)
 	}
 	if offset == "" {
-		// An empty offset means start from the beginning
-		offset = "0"
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
 	}
 	allKeyValues := table.Records.GetSortKeys(partKey)
 	var keyValues []string
@@ -496,6 +579,13 @@ func (table MemTable[T]) ReadEntitiesFromRow(ctx context.Context, row TableRow[T
 	if partKeyValue == "" {
 		return entities, nil
 	}
+	if offset == "" {
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
+	}
 	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, reverse, limit, offset)
 	if err != nil || len(sortKeyValues) == 0 {
 		return entities, nil
@@ -516,6 +606,13 @@ func (table MemTable[T]) ReadEntitiesFromRowAsJSON(ctx context.Context, row Tabl
 	}
 	if partKeyValue == "" {
 		return []byte("[]"), nil
+	}
+	if offset == "" {
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
 	}
 	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, reverse, limit, offset)
 	if err != nil || len(sortKeyValues) == 0 {
@@ -604,6 +701,13 @@ func (table MemTable[T]) ReadRecords(ctx context.Context, row TableRow[T], partK
 	if partKeyValue == "" {
 		return []Record{}, nil
 	}
+	if offset == "" {
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
+	}
 	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, reverse, limit, offset)
 	if err != nil || len(sortKeyValues) == 0 {
 		return []Record{}, err
@@ -650,6 +754,13 @@ func (table MemTable[T]) ReadTextValues(ctx context.Context, row TableRow[T], pa
 	if partKeyValue == "" {
 		return []TextValue{}, nil
 	}
+	if offset == "" {
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
+	}
 	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, reverse, limit, offset)
 	if err != nil || len(sortKeyValues) == 0 {
 		return []TextValue{}, err
@@ -686,6 +797,30 @@ func (table MemTable[T]) ReadAllTextValues(ctx context.Context, row TableRow[T],
 	return textValues, nil
 }
 
+// FilterTextValues returns all text values from the specified row that match the specified filter.
+// The resulting text values are sorted by value.
+func (table MemTable[T]) FilterTextValues(ctx context.Context, row TableRow[T], partKeyValue string, f func(TextValue) bool) ([]TextValue, error) {
+	if row.TextValue == nil {
+		return []TextValue{}, errors.New("row " + row.RowName + " must contain text values")
+	}
+	if partKeyValue == "" {
+		return []TextValue{}, nil
+	}
+	sortKeyValues, err := table.ReadAllSortKeyValues(ctx, row, partKeyValue)
+	if err != nil || len(sortKeyValues) == 0 {
+		return []TextValue{}, err
+	}
+	records := table.Records.GetRecords(row.getRowPartKeyValue(partKeyValue), sortKeyValues)
+	textValues := Map(records, func(r Record) TextValue {
+		return TextValue{Key: r.SortKeyValue, Value: r.TextValue}
+	})
+	textValues = Filter(textValues, f)
+	sort.Slice(textValues, func(i, j int) bool {
+		return textValues[i].Value < textValues[j].Value
+	})
+	return textValues, nil
+}
+
 // ReadNumericValue reads the specified numeric value from the specified row.
 func (table MemTable[T]) ReadNumericValue(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (NumValue, error) {
 	numValue := NumValue{Key: sortKeyValue, Value: 0}
@@ -711,6 +846,13 @@ func (table MemTable[T]) ReadNumericValues(ctx context.Context, row TableRow[T],
 	}
 	if partKeyValue == "" {
 		return []NumValue{}, nil
+	}
+	if offset == "" {
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
 	}
 	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, reverse, limit, offset)
 	if err != nil || len(sortKeyValues) == 0 {
