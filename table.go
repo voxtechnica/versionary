@@ -29,11 +29,15 @@ type TableWriter[T any] interface {
 	UpdateEntityVersion(ctx context.Context, oldVersion T, newVersion T) error
 	DeleteEntity(ctx context.Context, entity T) error
 	DeleteEntityWithID(ctx context.Context, entityID string) (T, error)
+	DeleteEntityVersionWithID(ctx context.Context, entityID, versionID string) (T, error)
 }
 
 // TableReader is the interface that defines methods for reading entity-related information from a DynamoDB table based
 // on an opinionated implementation of DynamoDB by Table.
 type TableReader[T any] interface {
+	IsValid() bool
+	GetEntityType() string
+	GetTableName() string
 	GetRow(rowName string) (TableRow[T], bool)
 	GetEntityRow() TableRow[T]
 	EntityID(entity T) string
@@ -41,6 +45,8 @@ type TableReader[T any] interface {
 	EntityReferenceID(entity T) string
 	EntityExists(ctx context.Context, entityID string) bool
 	EntityVersionExists(ctx context.Context, entityID string, versionID string) bool
+	CountPartKeyValues(ctx context.Context, row TableRow[T]) (int64, error)
+	CountSortKeyValues(ctx context.Context, row TableRow[T], partKeyValue string) (int64, error)
 	ReadAllPartKeyValues(ctx context.Context, row TableRow[T]) ([]string, error)
 	ReadAllSortKeyValues(ctx context.Context, row TableRow[T], partKeyValue string) ([]string, error)
 	ReadPartKeyValues(ctx context.Context, row TableRow[T], reverse bool, limit int, offset string) ([]string, error)
@@ -76,6 +82,7 @@ type TableReader[T any] interface {
 	ReadTextValue(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (TextValue, error)
 	ReadTextValues(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]TextValue, error)
 	ReadAllTextValues(ctx context.Context, row TableRow[T], partKeyValue string, sortByValue bool) ([]TextValue, error)
+	FilterTextValues(ctx context.Context, row TableRow[T], partKeyValue string, f func(TextValue) bool) ([]TextValue, error)
 	ReadNumericValue(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (NumValue, error)
 	ReadNumericValues(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]NumValue, error)
 	ReadAllNumericValues(ctx context.Context, row TableRow[T], partKeyValue string, sortByValue bool) ([]NumValue, error)
@@ -91,12 +98,12 @@ type TableReadWriter[T any] interface {
 // specific query, or question for the data. Example: "What error events occurred on this day?"
 //
 // The following attributes are stored in the table. These attribute names are configurable.
-//  - v_part: partition key (required)
-//  - v_sort: sorting key (required; for an entity row without versions, reuse the partition key)
-//  - v_json: gzip compressed JSON data (optional)
-//  - v_text: string value (optional)
-//  - v_num: double-wide floating point numeric value (optional)
-//  - v_expires: expiration timestamp in epoch seconds (optional)
+//   - v_part: partition key (required)
+//   - v_sort: sorting key (required; for an entity row without versions, reuse the partition key)
+//   - v_json: gzip compressed JSON data (optional)
+//   - v_text: string value (optional)
+//   - v_num: double-wide floating point numeric value (optional)
+//   - v_expires: expiration timestamp in epoch seconds (optional)
 //
 // Pipe-separated key values are used to avoid naming collisions, supporting multiple row types in a single table:
 // Entity Values: rowName|partKeyName|partKeyValue -- (sortKeyValue, value), (sortKeyValue, value), ...
@@ -402,6 +409,16 @@ func (table Table[T]) getAttributeNames() []string {
 		table.getNumericValueAttr(),
 		table.getTimeToLiveAttr(),
 	}
+}
+
+// GetEntityType returns the name of the entity type stored in this table.
+func (table Table[T]) GetEntityType() string {
+	return table.EntityType
+}
+
+// GetTableName returns the name of the table.
+func (table Table[T]) GetTableName() string {
+	return table.TableName
 }
 
 // GetRow returns the specified row definition.
@@ -728,6 +745,55 @@ func (table Table[T]) DeleteEntityWithID(ctx context.Context, entityID string) (
 	return entity, table.DeleteEntity(ctx, entity)
 }
 
+// DeleteEntityVersionWithID deletes the specified version of the entity from the table.
+func (table Table[T]) DeleteEntityVersionWithID(ctx context.Context, entityID, versionID string) (T, error) {
+	// Does the entity version exist?
+	entity, err := table.ReadEntityVersion(ctx, entityID, versionID)
+	if err == ErrNotFound {
+		return entity, err
+	} else if err != nil {
+		return entity, fmt.Errorf("failed read version to delete %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+	}
+	// If the specified version is the current version, then we need to update the index rows.
+	currentVersionID, err := table.ReadCurrentEntityVersionID(ctx, entityID)
+	if err != nil {
+		return entity, fmt.Errorf("failed read current version ID to delete %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+	}
+	if currentVersionID == versionID {
+		// It's the current version. Is there a previous version?
+		var versionIDs []string
+		versionIDs, err = table.ReadEntityVersionIDs(ctx, entityID, true, 1, currentVersionID)
+		if err != nil {
+			return entity, fmt.Errorf("failed read previous version ID to delete %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+		}
+		// If there is no previous version, just delete the entity
+		if len(versionIDs) == 0 {
+			err = table.DeleteEntity(ctx, entity)
+			if err != nil {
+				return entity, fmt.Errorf("failed to delete entity %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+			}
+			return entity, nil
+		}
+		// Update the entity index rows to the previous version
+		var previousVersion T
+		previousVersion, err = table.ReadEntityVersion(ctx, entityID, versionIDs[0])
+		if err != nil {
+			return entity, fmt.Errorf("failed read previous version to delete %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+		}
+		err = table.UpdateEntityVersion(ctx, entity, previousVersion)
+		if err != nil {
+			return entity, fmt.Errorf("failed update previous version to delete %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+		}
+	}
+	// Delete the specified version of the entity
+	partKey := table.EntityRow.getRowPartKeyValue(entityID)
+	err = table.DeleteItem(ctx, partKey, versionID)
+	if err != nil {
+		return entity, fmt.Errorf("failed to delete %s-%s-%s: %w", table.EntityType, entityID, versionID, err)
+	}
+	return entity, nil
+}
+
 // DeleteRow deletes the entire row for the specified partition key.
 func (table Table[T]) DeleteRow(ctx context.Context, row TableRow[T], partKeyValue string) error {
 	if partKeyValue == "" {
@@ -782,6 +848,12 @@ func (table Table[T]) DeleteItem(ctx context.Context, rowPartKeyValue string, so
 	return nil
 }
 
+// CountPartKeyValues returns the total number of partition key values in the specified row.
+// Note that this may be a slow operation; it pages through all the values to count them.
+func (table Table[T]) CountPartKeyValues(ctx context.Context, row TableRow[T]) (int64, error) {
+	return table.CountSortKeyValues(ctx, row, "")
+}
+
 // ReadAllPartKeyValues reads all the values of the partition keys used for the specified row.
 // Note that for some rows, this may be a very large number of values.
 func (table Table[T]) ReadAllPartKeyValues(ctx context.Context, row TableRow[T]) ([]string, error) {
@@ -791,6 +863,41 @@ func (table Table[T]) ReadAllPartKeyValues(ctx context.Context, row TableRow[T])
 // ReadPartKeyValues reads paginated partition key values for the specified row.
 func (table Table[T]) ReadPartKeyValues(ctx context.Context, row TableRow[T], reverse bool, limit int, offset string) ([]string, error) {
 	return table.ReadSortKeyValues(ctx, row, "", reverse, limit, offset)
+}
+
+// CountSortKeyValues returns the total number of sort key values for the specified row and partition key value.
+// Note that this may be a slow operation; it pages through all the values to count them.
+func (table Table[T]) CountSortKeyValues(ctx context.Context, row TableRow[T], partKeyValue string) (int64, error) {
+	var partKey string
+	if partKeyValue == "" {
+		// Read partition key values
+		partKey = row.getRowPartKey()
+	} else {
+		// Read sort key values
+		partKey = row.getRowPartKeyValue(partKeyValue)
+	}
+	var count int64
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: partKey},
+		},
+		KeyConditionExpression: aws.String("#p = :p"),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr()),
+		ScanIndexForward:       aws.Bool(true),
+	}
+	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return count, fmt.Errorf("failed counting sort key values for row %s from table %s: %w", partKey, table.TableName, err)
+		}
+		count += int64(page.Count)
+	}
+	return count, nil
 }
 
 // ReadAllSortKeyValues reads all the sort key values for the specified row and partition key value.
@@ -848,8 +955,11 @@ func (table Table[T]) ReadSortKeyValues(ctx context.Context, row TableRow[T], pa
 		partKey = row.getRowPartKeyValue(partKeyValue)
 	}
 	if offset == "" {
-		// An empty offset means start from the beginning
-		offset = "0"
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
 	}
 	keyValues := make([]string, 0)
 	keyConditionExpression := "#p = :p and #s > :s"
@@ -1238,6 +1348,13 @@ func (table Table[T]) ReadEntitiesFromRow(ctx context.Context, row TableRow[T], 
 	if partKeyValue == "" {
 		return entities, nil
 	}
+	if offset == "" {
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
+	}
 	keyConditionExpression := "#p = :p and #s > :s"
 	if reverse {
 		keyConditionExpression = "#p = :p and #s < :s"
@@ -1282,6 +1399,13 @@ func (table Table[T]) ReadEntitiesFromRowAsJSON(ctx context.Context, row TableRo
 	}
 	if partKeyValue == "" {
 		return []byte("[]"), nil
+	}
+	if offset == "" {
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
 	}
 	keyConditionExpression := "#p = :p and #s > :s"
 	if reverse {
@@ -1452,6 +1576,13 @@ func (table Table[T]) ReadRecords(ctx context.Context, row TableRow[T], partKeyV
 	if partKeyValue == "" {
 		return records, nil
 	}
+	if offset == "" {
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
+	}
 	keyConditionExpression := "#p = :p and #s > :s"
 	if reverse {
 		keyConditionExpression = "#p = :p and #s < :s"
@@ -1560,6 +1691,13 @@ func (table Table[T]) ReadTextValues(ctx context.Context, row TableRow[T], partK
 	if partKeyValue == "" {
 		return textValues, nil
 	}
+	if offset == "" {
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
+	}
 	keyConditionExpression := "#p = :p and #s > :s"
 	if reverse {
 		keyConditionExpression = "#p = :p and #s < :s"
@@ -1641,6 +1779,53 @@ func (table Table[T]) ReadAllTextValues(ctx context.Context, row TableRow[T], pa
 	return textValues, nil
 }
 
+// FilterTextValues returns all text values from the specified row that match the specified filter.
+// The resulting text values are sorted by value.
+func (table Table[T]) FilterTextValues(ctx context.Context, row TableRow[T], partKeyValue string, f func(TextValue) bool) ([]TextValue, error) {
+	textValues := make([]TextValue, 0)
+	if row.TextValue == nil {
+		return textValues, errors.New("row " + row.RowName + " must contain text values")
+	}
+	if partKeyValue == "" {
+		return textValues, nil
+	}
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
+		},
+		KeyConditionExpression: aws.String("#p = :p"),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr() + ", " + table.getTextValueAttr()),
+		ScanIndexForward:       aws.Bool(true),
+	}
+	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return textValues, fmt.Errorf("error filtering text values %s %s: %w",
+				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
+		}
+		for _, item := range page.Items {
+			if item != nil && item[table.getSortKeyAttr()] != nil && item[table.getTextValueAttr()] != nil {
+				tv := TextValue{
+					Key:   item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value,
+					Value: item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value,
+				}
+				if f(tv) {
+					textValues = append(textValues, tv)
+				}
+			}
+		}
+	}
+	sort.Slice(textValues, func(i, j int) bool {
+		return textValues[i].Value < textValues[j].Value
+	})
+	return textValues, nil
+}
+
 // ReadNumericValue reads the specified numeric value from the specified row.
 func (table Table[T]) ReadNumericValue(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (NumValue, error) {
 	numValue := NumValue{Key: sortKeyValue, Value: 0}
@@ -1679,6 +1864,13 @@ func (table Table[T]) ReadNumericValues(ctx context.Context, row TableRow[T], pa
 	}
 	if partKeyValue == "" {
 		return numValues, nil
+	}
+	if offset == "" {
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
 	}
 	keyConditionExpression := "#p = :p and #s > :s"
 	if reverse {
