@@ -728,6 +728,112 @@ func (table MemTable[T]) ReadAllRecords(ctx context.Context, row TableRow[T], pa
 	return table.Records.GetRecords(row.getRowPartKeyValue(partKeyValue), sortKeyValues), nil
 }
 
+// ReadEntityLabel reads the label for the specified entity.
+func (table MemTable[T]) ReadEntityLabel(ctx context.Context, entityID string) (TextValue, error) {
+	return table.ReadPartKeyLabel(ctx, table.EntityRow, entityID)
+}
+
+// ReadEntityLabels reads paginated entity labels.
+func (table MemTable[T]) ReadEntityLabels(ctx context.Context, reverse bool, limit int, offset string) ([]TextValue, error) {
+	return table.ReadPartKeyLabels(ctx, table.EntityRow, reverse, limit, offset)
+}
+
+// ReadAllEntityLabels reads all entity labels.
+// Note: this can return a very large number of values! Use with caution.
+func (table MemTable[T]) ReadAllEntityLabels(ctx context.Context, sortByValue bool) ([]TextValue, error) {
+	return table.ReadAllPartKeyLabels(ctx, table.EntityRow, sortByValue)
+}
+
+// FilterEntityLabels returns all entity labels that match the specified filter.
+// The resulting text values are sorted by value.
+func (table MemTable[T]) FilterEntityLabels(ctx context.Context, f func(TextValue) bool) ([]TextValue, error) {
+	return table.FilterPartKeyLabels(ctx, table.EntityRow, f)
+}
+
+// ReadPartKeyLabel reads the text label for the specified partition key value from the specified row.
+func (table MemTable[T]) ReadPartKeyLabel(ctx context.Context, row TableRow[T], partKeyValue string) (TextValue, error) {
+	textValue := TextValue{Key: partKeyValue, Value: ""}
+	if row.PartKeyLabel == nil {
+		return textValue, errors.New("row " + row.RowName + " must contain partition key labels")
+	}
+	if partKeyValue == "" {
+		return textValue, ErrNotFound
+	}
+	r, ok := table.Records.GetRecord(row.getRowPartKey(), partKeyValue)
+	if !ok {
+		return textValue, ErrNotFound
+	}
+	textValue.Key = r.SortKeyValue
+	textValue.Value = r.TextValue
+	return textValue, nil
+}
+
+// ReadPartKeyLabels reads paginated partition key labels from the specified row.
+func (table MemTable[T]) ReadPartKeyLabels(ctx context.Context, row TableRow[T], reverse bool, limit int, offset string) ([]TextValue, error) {
+	if row.PartKeyLabel == nil {
+		return []TextValue{}, errors.New("row " + row.RowName + " must contain partition key labels")
+	}
+	if offset == "" {
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
+	}
+	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, "", reverse, limit, offset)
+	if err != nil || len(sortKeyValues) == 0 {
+		return []TextValue{}, err
+	}
+	records := table.Records.GetRecords(row.getRowPartKey(), sortKeyValues)
+	textValues := Map(records, func(r Record) TextValue {
+		return TextValue{Key: r.SortKeyValue, Value: r.TextValue}
+	})
+	return textValues, nil
+}
+
+// ReadAllPartKeyLabels reads all partition key labels from the specified row.
+// Note: this can return a very large number of values! Use with caution.
+func (table MemTable[T]) ReadAllPartKeyLabels(ctx context.Context, row TableRow[T], sortByValue bool) ([]TextValue, error) {
+	if row.PartKeyLabel == nil {
+		return []TextValue{}, errors.New("row " + row.RowName + " must contain partition key labels")
+	}
+	sortKeyValues, err := table.ReadAllSortKeyValues(ctx, row, "")
+	if err != nil || len(sortKeyValues) == 0 {
+		return []TextValue{}, err
+	}
+	records := table.Records.GetRecords(row.getRowPartKey(), sortKeyValues)
+	textValues := Map(records, func(r Record) TextValue {
+		return TextValue{Key: r.SortKeyValue, Value: r.TextValue}
+	})
+	if sortByValue {
+		sort.Slice(textValues, func(i, j int) bool {
+			return textValues[i].Value < textValues[j].Value
+		})
+	}
+	return textValues, nil
+}
+
+// FilterPartKeyLabels returns all partition key labels from the specified row that match the specified filter.
+// The resulting text values are sorted by value.
+func (table MemTable[T]) FilterPartKeyLabels(ctx context.Context, row TableRow[T], f func(TextValue) bool) ([]TextValue, error) {
+	if row.PartKeyLabel == nil {
+		return []TextValue{}, errors.New("row " + row.RowName + " must contain partition key labels")
+	}
+	sortKeyValues, err := table.ReadAllSortKeyValues(ctx, row, "")
+	if err != nil || len(sortKeyValues) == 0 {
+		return []TextValue{}, err
+	}
+	records := table.Records.GetRecords(row.getRowPartKey(), sortKeyValues)
+	textValues := Map(records, func(r Record) TextValue {
+		return TextValue{Key: r.SortKeyValue, Value: r.TextValue}
+	})
+	textValues = Filter(textValues, f)
+	sort.Slice(textValues, func(i, j int) bool {
+		return textValues[i].Value < textValues[j].Value
+	})
+	return textValues, nil
+}
+
 // ReadTextValue reads the specified text value from the specified row.
 func (table MemTable[T]) ReadTextValue(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (TextValue, error) {
 	textValue := TextValue{Key: sortKeyValue, Value: ""}

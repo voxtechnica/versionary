@@ -79,6 +79,14 @@ type TableReader[T any] interface {
 	ReadRecord(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (Record, error)
 	ReadRecords(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]Record, error)
 	ReadAllRecords(ctx context.Context, row TableRow[T], partKeyValue string) ([]Record, error)
+	ReadEntityLabel(ctx context.Context, entityID string) (TextValue, error)
+	ReadEntityLabels(ctx context.Context, reverse bool, limit int, offset string) ([]TextValue, error)
+	ReadAllEntityLabels(ctx context.Context, sortByValue bool) ([]TextValue, error)
+	FilterEntityLabels(ctx context.Context, f func(TextValue) bool) ([]TextValue, error)
+	ReadPartKeyLabel(ctx context.Context, row TableRow[T], partKeyValue string) (TextValue, error)
+	ReadPartKeyLabels(ctx context.Context, row TableRow[T], reverse bool, limit int, offset string) ([]TextValue, error)
+	ReadAllPartKeyLabels(ctx context.Context, row TableRow[T], sortByValue bool) ([]TextValue, error)
+	FilterPartKeyLabels(ctx context.Context, row TableRow[T], f func(TextValue) bool) ([]TextValue, error)
 	ReadTextValue(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (TextValue, error)
 	ReadTextValues(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]TextValue, error)
 	ReadAllTextValues(ctx context.Context, row TableRow[T], partKeyValue string, sortByValue bool) ([]TextValue, error)
@@ -107,7 +115,7 @@ type TableReadWriter[T any] interface {
 //
 // Pipe-separated key values are used to avoid naming collisions, supporting multiple row types in a single table:
 // Entity Values: rowName|partKeyName|partKeyValue -- (sortKeyValue, value), (sortKeyValue, value), ...
-// Partition Keys: rowName|partKeyName -- partKeyValue, partKeyValue, ...
+// Partition Keys: rowName|partKeyName -- (partKeyValue, label), (partKeyValue, label), ...
 // Note that in addition to storing the entity data in a given row, we're also storing the partition key values used
 // for each row, to support queries that "walk" the entire data set for a given row type.
 type TableRow[T any] struct {
@@ -115,6 +123,7 @@ type TableRow[T any] struct {
 	PartKeyName   string
 	PartKeyValue  func(T) string
 	PartKeyValues func(T) []string
+	PartKeyLabel  func(T) string
 	SortKeyName   string
 	SortKeyValue  func(T) string
 	JsonValue     func(T) []byte
@@ -218,10 +227,13 @@ func (row TableRow[T]) getWriteRecords(entity T) []Record {
 		records = append(records, r)
 
 		// Track the unique partition key values for this row
-		// Partition Keys: rowName|partKeyName -- partKeyValue, partKeyValue, ...
+		// Partition Keys: rowName|partKeyName -- (partKeyValue, partKeyLabel), (partKeyValue, partKeyLabel), ...
 		k := Record{
 			PartKeyValue: row.getRowPartKey(), // rowName|partKeyName
 			SortKeyValue: partKeyValue,
+		}
+		if row.PartKeyLabel != nil {
+			k.TextValue = row.PartKeyLabel(entity)
 		}
 		if row.TimeToLive != nil {
 			k.TimeToLive = row.TimeToLive(entity)
@@ -1652,6 +1664,197 @@ func (table Table[T]) ReadAllRecords(ctx context.Context, row TableRow[T], partK
 	return records, nil
 }
 
+// ReadEntityLabel reads the label for the specified entity.
+func (table Table[T]) ReadEntityLabel(ctx context.Context, entityID string) (TextValue, error) {
+	return table.ReadPartKeyLabel(ctx, table.EntityRow, entityID)
+}
+
+// ReadEntityLabels reads paginated entity labels.
+func (table Table[T]) ReadEntityLabels(ctx context.Context, reverse bool, limit int, offset string) ([]TextValue, error) {
+	return table.ReadPartKeyLabels(ctx, table.EntityRow, reverse, limit, offset)
+}
+
+// ReadAllEntityLabels reads all entity labels.
+// Note: this can return a very large number of values! Use with caution.
+func (table Table[T]) ReadAllEntityLabels(ctx context.Context, sortByValue bool) ([]TextValue, error) {
+	return table.ReadAllPartKeyLabels(ctx, table.EntityRow, sortByValue)
+}
+
+// FilterEntityLabels returns all entity labels that match the specified filter.
+// The resulting text values are sorted by value.
+func (table Table[T]) FilterEntityLabels(ctx context.Context, f func(TextValue) bool) ([]TextValue, error) {
+	return table.FilterPartKeyLabels(ctx, table.EntityRow, f)
+}
+
+// ReadPartKeyLabel reads the text label for the specified partition key value from the specified row.
+func (table Table[T]) ReadPartKeyLabel(ctx context.Context, row TableRow[T], partKeyValue string) (TextValue, error) {
+	textValue := TextValue{Key: partKeyValue, Value: ""}
+	if row.PartKeyLabel == nil {
+		return textValue, errors.New("row " + row.RowName + " must contain partition key labels")
+	}
+	if partKeyValue == "" {
+		return textValue, ErrNotFound
+	}
+	req := dynamodb.GetItemInput{
+		TableName: aws.String(table.TableName),
+		Key: map[string]types.AttributeValue{
+			table.getPartKeyAttr(): &types.AttributeValueMemberS{Value: row.getRowPartKey()},
+			table.getSortKeyAttr(): &types.AttributeValueMemberS{Value: partKeyValue},
+		},
+		ProjectionExpression: aws.String(table.getSortKeyAttr() + ", " + table.getTextValueAttr()),
+	}
+	res, err := table.Client.GetItem(ctx, &req)
+	if err != nil {
+		return textValue, fmt.Errorf("error reading partition key label %s %s %s: %w",
+			table.EntityType, row.getRowPartKey(), partKeyValue, err)
+	}
+	if res.Item == nil || res.Item[table.getSortKeyAttr()] == nil {
+		return textValue, ErrNotFound
+	}
+	textValue.Key = res.Item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value
+	if res.Item[table.getTextValueAttr()] != nil {
+		textValue.Value = res.Item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
+	}
+	return textValue, nil
+}
+
+// ReadPartKeyLabels reads paginated partition key labels from the specified row.
+func (table Table[T]) ReadPartKeyLabels(ctx context.Context, row TableRow[T], reverse bool, limit int, offset string) ([]TextValue, error) {
+	textValues := make([]TextValue, 0)
+	if row.PartKeyLabel == nil {
+		return textValues, errors.New("row " + row.RowName + " must contain partition key labels")
+	}
+	if offset == "" {
+		if reverse {
+			offset = "|" // after letters
+		} else {
+			offset = "-" // before numbers
+		}
+	}
+	keyConditionExpression := "#p = :p and #s > :s"
+	if reverse {
+		keyConditionExpression = "#p = :p and #s < :s"
+	}
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: row.getRowPartKey()},
+			":s": &types.AttributeValueMemberS{Value: offset},
+		},
+		KeyConditionExpression: aws.String(keyConditionExpression),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr() + ", " + table.getTextValueAttr()),
+		ScanIndexForward:       aws.Bool(!reverse),
+		Limit:                  aws.Int32(int32(limit)),
+	}
+	res, err := table.Client.Query(ctx, &req)
+	if err != nil {
+		return textValues, fmt.Errorf("error reading paginated partition key labels %s %s: %w",
+			table.EntityType, row.getRowPartKey(), err)
+	}
+	for _, item := range res.Items {
+		if item != nil && item[table.getSortKeyAttr()] != nil {
+			tv := TextValue{Key: item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value}
+			if item[table.getTextValueAttr()] != nil {
+				tv.Value = item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
+			}
+			textValues = append(textValues, tv)
+		}
+	}
+	return textValues, nil
+}
+
+// ReadAllPartKeyLabels reads all partition key labels from the specified row.
+// Note: this can return a very large number of values! Use with caution.
+func (table Table[T]) ReadAllPartKeyLabels(ctx context.Context, row TableRow[T], sortByValue bool) ([]TextValue, error) {
+	textValues := make([]TextValue, 0)
+	if row.PartKeyLabel == nil {
+		return textValues, errors.New("row " + row.RowName + " must contain partition key labels")
+	}
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: row.getRowPartKey()},
+		},
+		KeyConditionExpression: aws.String("#p = :p"),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr() + ", " + table.getTextValueAttr()),
+		ScanIndexForward:       aws.Bool(true),
+	}
+	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return textValues, fmt.Errorf("error reading all partition key labels %s %s: %w",
+				table.EntityType, row.getRowPartKey(), err)
+		}
+		for _, item := range page.Items {
+			if item != nil && item[table.getSortKeyAttr()] != nil {
+				tv := TextValue{Key: item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value}
+				if item[table.getTextValueAttr()] != nil {
+					tv.Value = item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
+				}
+				textValues = append(textValues, tv)
+			}
+		}
+	}
+	if sortByValue {
+		sort.Slice(textValues, func(i, j int) bool {
+			return textValues[i].Value < textValues[j].Value
+		})
+	}
+	return textValues, nil
+}
+
+// FilterPartKeyLabels returns all partition key labels from the specified row that match the specified filter.
+// The resulting text values are sorted by value.
+func (table Table[T]) FilterPartKeyLabels(ctx context.Context, row TableRow[T], f func(TextValue) bool) ([]TextValue, error) {
+	textValues := make([]TextValue, 0)
+	if row.PartKeyLabel == nil {
+		return textValues, errors.New("row " + row.RowName + " must contain partition key labels")
+	}
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: row.getRowPartKey()},
+		},
+		KeyConditionExpression: aws.String("#p = :p"),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr() + ", " + table.getTextValueAttr()),
+		ScanIndexForward:       aws.Bool(true),
+	}
+	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return textValues, fmt.Errorf("error filtering partition key labels %s %s: %w",
+				table.EntityType, row.getRowPartKey(), err)
+		}
+		for _, item := range page.Items {
+			if item != nil && item[table.getSortKeyAttr()] != nil {
+				tv := TextValue{Key: item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value}
+				if item[table.getTextValueAttr()] != nil {
+					tv.Value = item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
+				}
+				if f(tv) {
+					textValues = append(textValues, tv)
+				}
+			}
+		}
+	}
+	sort.Slice(textValues, func(i, j int) bool {
+		return textValues[i].Value < textValues[j].Value
+	})
+	return textValues, nil
+}
+
 // ReadTextValue reads the specified text value from the specified row.
 func (table Table[T]) ReadTextValue(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (TextValue, error) {
 	textValue := TextValue{Key: sortKeyValue, Value: ""}
@@ -1674,11 +1877,13 @@ func (table Table[T]) ReadTextValue(ctx context.Context, row TableRow[T], partKe
 		return textValue, fmt.Errorf("error reading text value %s %s %s: %w",
 			table.EntityType, row.getRowPartKeyValue(partKeyValue), sortKeyValue, err)
 	}
-	if res.Item == nil || res.Item[table.getSortKeyAttr()] == nil || res.Item[table.getTextValueAttr()] == nil {
+	if res.Item == nil || res.Item[table.getSortKeyAttr()] == nil {
 		return textValue, ErrNotFound
 	}
 	textValue.Key = res.Item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value
-	textValue.Value = res.Item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
+	if res.Item[table.getTextValueAttr()] != nil {
+		textValue.Value = res.Item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
+	}
 	return textValue, nil
 }
 
@@ -1723,11 +1928,12 @@ func (table Table[T]) ReadTextValues(ctx context.Context, row TableRow[T], partK
 			table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 	}
 	for _, item := range res.Items {
-		if item != nil && item[table.getSortKeyAttr()] != nil && item[table.getTextValueAttr()] != nil {
-			textValues = append(textValues, TextValue{
-				Key:   item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value,
-				Value: item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value,
-			})
+		if item != nil && item[table.getSortKeyAttr()] != nil {
+			tv := TextValue{Key: item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value}
+			if item[table.getTextValueAttr()] != nil {
+				tv.Value = item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
+			}
+			textValues = append(textValues, tv)
 		}
 	}
 	return textValues, nil
@@ -1763,11 +1969,12 @@ func (table Table[T]) ReadAllTextValues(ctx context.Context, row TableRow[T], pa
 				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 		}
 		for _, item := range page.Items {
-			if item != nil && item[table.getSortKeyAttr()] != nil && item[table.getTextValueAttr()] != nil {
-				textValues = append(textValues, TextValue{
-					Key:   item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value,
-					Value: item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value,
-				})
+			if item != nil && item[table.getSortKeyAttr()] != nil {
+				tv := TextValue{Key: item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value}
+				if item[table.getTextValueAttr()] != nil {
+					tv.Value = item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
+				}
+				textValues = append(textValues, tv)
 			}
 		}
 	}
@@ -1809,10 +2016,10 @@ func (table Table[T]) FilterTextValues(ctx context.Context, row TableRow[T], par
 				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 		}
 		for _, item := range page.Items {
-			if item != nil && item[table.getSortKeyAttr()] != nil && item[table.getTextValueAttr()] != nil {
-				tv := TextValue{
-					Key:   item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value,
-					Value: item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value,
+			if item != nil && item[table.getSortKeyAttr()] != nil {
+				tv := TextValue{Key: item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value}
+				if item[table.getTextValueAttr()] != nil {
+					tv.Value = item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
 				}
 				if f(tv) {
 					textValues = append(textValues, tv)
@@ -1848,11 +2055,13 @@ func (table Table[T]) ReadNumericValue(ctx context.Context, row TableRow[T], par
 		return numValue, fmt.Errorf("error reading numeric value %s %s %s: %w",
 			table.EntityType, row.getRowPartKeyValue(partKeyValue), sortKeyValue, err)
 	}
-	if res.Item == nil || res.Item[table.getSortKeyAttr()] == nil || res.Item[table.getNumericValueAttr()] == nil {
+	if res.Item == nil || res.Item[table.getSortKeyAttr()] == nil {
 		return numValue, ErrNotFound
 	}
 	numValue.Key = res.Item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value
-	numValue.Value, _ = strconv.ParseFloat(res.Item[table.getNumericValueAttr()].(*types.AttributeValueMemberN).Value, 64)
+	if res.Item[table.getNumericValueAttr()] != nil {
+		numValue.Value, _ = strconv.ParseFloat(res.Item[table.getNumericValueAttr()].(*types.AttributeValueMemberN).Value, 64)
+	}
 	return numValue, nil
 }
 
@@ -1897,10 +2106,12 @@ func (table Table[T]) ReadNumericValues(ctx context.Context, row TableRow[T], pa
 			table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 	}
 	for _, item := range res.Items {
-		if item != nil && item[table.getSortKeyAttr()] != nil && item[table.getNumericValueAttr()] != nil {
-			key := item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value
-			value, _ := strconv.ParseFloat(item[table.getNumericValueAttr()].(*types.AttributeValueMemberN).Value, 64)
-			numValues = append(numValues, NumValue{Key: key, Value: value})
+		if item != nil && item[table.getSortKeyAttr()] != nil {
+			nv := NumValue{Key: item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value}
+			if item[table.getNumericValueAttr()] != nil {
+				nv.Value, _ = strconv.ParseFloat(item[table.getNumericValueAttr()].(*types.AttributeValueMemberN).Value, 64)
+			}
+			numValues = append(numValues, nv)
 		}
 	}
 	return numValues, nil
@@ -1936,10 +2147,12 @@ func (table Table[T]) ReadAllNumericValues(ctx context.Context, row TableRow[T],
 				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
 		}
 		for _, item := range page.Items {
-			if item != nil && item[table.getSortKeyAttr()] != nil && item[table.getNumericValueAttr()] != nil {
-				key := item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value
-				value, _ := strconv.ParseFloat(item[table.getNumericValueAttr()].(*types.AttributeValueMemberN).Value, 64)
-				numValues = append(numValues, NumValue{Key: key, Value: value})
+			if item != nil && item[table.getSortKeyAttr()] != nil {
+				nv := NumValue{Key: item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value}
+				if item[table.getNumericValueAttr()] != nil {
+					nv.Value, _ = strconv.ParseFloat(item[table.getNumericValueAttr()].(*types.AttributeValueMemberN).Value, 64)
+				}
+				numValues = append(numValues, nv)
 			}
 		}
 	}

@@ -2,15 +2,17 @@ package versionary
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/voxtechnica/tuid-go"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/voxtechnica/tuid-go"
 )
 
 var (
@@ -620,6 +622,99 @@ func TestTable_ReadRecords(t *testing.T) {
 	}
 }
 
+func TestTable_ReadEntityLabel(t *testing.T) {
+	// Read an expected entity label
+	label, err := testTable.ReadEntityLabel(ctx, v11.ID)
+	if err != nil {
+		t.Errorf("ReadEntityLabel failed: %v", err)
+	} else if label.Value != v11.Message {
+		t.Errorf("expected label %s, got %s", v11.Message, label.Value)
+	}
+
+	// Read a non-existent entity label
+	label, err = testTable.ReadEntityLabel(ctx, tuid.NewID().String())
+	if err == nil {
+		t.Errorf("expected ReadEntityLabel not found, received: %s", label)
+	} else if !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ReadEntityLabel not found, received: %s", err.Error())
+	}
+
+	// Read a partition key label from a row that does not have one
+	row, ok := testTable.GetRow("messages_tag")
+	if ok {
+		label, err = testTable.ReadPartKeyLabel(ctx, row, "tag1")
+		if err == nil {
+			t.Errorf("expected ReadPartKeyLabel row config error, received none")
+		}
+	} else {
+		t.Errorf("messages_tag row not found")
+	}
+}
+
+func TestTable_ReadEntityLabels(t *testing.T) {
+	// Read all entity labels, sorted by value
+	labels, err := testTable.ReadAllEntityLabels(ctx, true)
+	if err != nil {
+		t.Errorf("ReadAllEntityLabels failed: %v", err)
+	} else if len(labels) < 2 {
+		t.Errorf("expected 2 labels, got %d", len(labels))
+	} else {
+		// Check that the labels are sorted
+		for i := 0; i < len(labels)-1; i++ {
+			if labels[i].Value > labels[i+1].Value {
+				t.Errorf("labels are not sorted")
+			}
+		}
+		if labels[0].Value != v20.Message {
+			t.Errorf("expected label %s, got %s", v20.Message, labels[0].Value)
+		}
+		if labels[1].Value != v11.Message {
+			t.Errorf("expected label %s, got %s", v11.Message, labels[1].Value)
+		}
+	}
+
+	// Filter entity labels (contains any term)
+	terms := strings.Fields(strings.ToLower(v11.Message + " " + v20.Message))
+	labels, err = testTable.FilterEntityLabels(ctx, func(tv TextValue) bool {
+		return tv.ContainsAny(terms)
+	})
+	if err != nil {
+		t.Errorf("FilterEntityLabels failed: %v", err)
+	} else if len(labels) != 2 {
+		t.Errorf("expected 2 entity labels, got %d", len(labels))
+	}
+
+	// Filter entity labels (contains all terms)
+	labels, err = testTable.FilterEntityLabels(ctx, func(tv TextValue) bool {
+		return tv.ContainsAll(terms)
+	})
+	if err != nil {
+		t.Errorf("FilterEntityLabels failed: %v", err)
+	} else if len(labels) != 0 {
+		t.Errorf("expected 0 entity labels, got %d", len(labels))
+	}
+
+	// Read paginated entity labels (forward sort order)
+	labels, err = testTable.ReadEntityLabels(ctx, false, 1, "")
+	if err != nil {
+		t.Errorf("ReadEntityLabels failed: %v", err)
+	} else if len(labels) == 0 {
+		t.Errorf("expected an entity label, got %d", len(labels))
+	} else if !reflect.DeepEqual(TextValue{Key: v11.ID, Value: v11.Message}, labels[0]) {
+		t.Errorf("paginated entity labels are not equal (forward)")
+	}
+
+	// Read paginated entity labels (reverse sort order)
+	labels, err = testTable.ReadEntityLabels(ctx, true, 1, "")
+	if err != nil {
+		t.Errorf("ReadEntityLabels failed: %v", err)
+	} else if len(labels) == 0 {
+		t.Errorf("expected a text value, got %d", len(labels))
+	} else if !reflect.DeepEqual(TextValue{Key: v20.ID, Value: v20.Message}, labels[0]) {
+		t.Errorf("paginated entity labels are not equal (reverse)")
+	}
+}
+
 func TestTable_ReadTextValue(t *testing.T) {
 	row, ok := testTable.GetRow("messages_tag")
 	if !ok {
@@ -919,6 +1014,7 @@ func newThingTable(dbClient *dynamodb.Client, env string) Table[versionableThing
 		PartKeyName:   "id",
 		PartKeyValue:  func(v versionableThing) string { return v.ID },
 		PartKeyValues: nil,
+		PartKeyLabel:  func(v versionableThing) string { return v.Message },
 		SortKeyName:   "update_id",
 		SortKeyValue:  func(v versionableThing) string { return v.UpdateID },
 		JsonValue:     func(v versionableThing) []byte { return v.CompressedJSON() },
