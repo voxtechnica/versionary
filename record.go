@@ -1,6 +1,7 @@
 package versionary
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -35,10 +36,20 @@ func (tv TextValue) ContainsAll(terms []string) bool {
 	return true
 }
 
+// String returns a string representation of the TextValue.
+func (tv TextValue) String() string {
+	return tv.Key + ": " + tv.Value
+}
+
 // NumValue represents a key-value pair where the value is a number.
 type NumValue struct {
 	Key   string  `json:"key"`
 	Value float64 `json:"value"`
+}
+
+// String returns a string representation of the NumValue.
+func (nv NumValue) String() string {
+	return fmt.Sprintf("%s: %g", nv.Key, nv.Value)
 }
 
 // Record is a struct that represents a single item in a database table. PartKeyValue and SortKeyValue
