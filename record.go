@@ -1,56 +1,8 @@
 package versionary
 
 import (
-	"fmt"
 	"sort"
-	"strings"
 )
-
-// TextValue represents a key-value pair where the value is a string.
-type TextValue struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
-}
-
-// ContainsAny returns true if the Value contains any of the terms (an OR filter).
-// The terms should be lowercase for a case-insensitive search.
-func (tv TextValue) ContainsAny(terms []string) bool {
-	v := strings.ToLower(tv.Value)
-	for _, t := range terms {
-		if strings.Contains(v, t) {
-			return true
-		}
-	}
-	return false
-}
-
-// ContainsAll returns true if the Value contains all the terms (an AND filter).
-// The terms should be lowercase for a case-insensitive search.
-func (tv TextValue) ContainsAll(terms []string) bool {
-	v := strings.ToLower(tv.Value)
-	for _, t := range terms {
-		if !strings.Contains(v, t) {
-			return false
-		}
-	}
-	return true
-}
-
-// String returns a string representation of the TextValue.
-func (tv TextValue) String() string {
-	return tv.Key + ": " + tv.Value
-}
-
-// NumValue represents a key-value pair where the value is a number.
-type NumValue struct {
-	Key   string  `json:"key"`
-	Value float64 `json:"value"`
-}
-
-// String returns a string representation of the NumValue.
-func (nv NumValue) String() string {
-	return fmt.Sprintf("%s: %g", nv.Key, nv.Value)
-}
 
 // Record is a struct that represents a single item in a database table. PartKeyValue and SortKeyValue
 // are used to represent the primary key and are required fields. All other fields are optional.
