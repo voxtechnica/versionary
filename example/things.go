@@ -216,10 +216,20 @@ func (s Service) ReadAllVersionsAsJSON(ctx context.Context, id string) ([]byte, 
 	return s.Table.ReadAllEntityVersionsAsJSON(ctx, id)
 }
 
+// CountThings returns the number of Things in the Thing table.
+func (s Service) CountThings(ctx context.Context) (int64, error) {
+	return s.Table.CountPartKeyValues(ctx, rowThingsVersion)
+}
+
 // ReadThingIDs returns a paginated list of Thing IDs in the Thing table.
 // Sorting is chronological (or reverse). The offset is the last ID returned in a previous request.
 func (s Service) ReadThingIDs(ctx context.Context, reverse bool, limit int, offset string) ([]string, error) {
 	return s.Table.ReadEntityIDs(ctx, reverse, limit, offset)
+}
+
+// ReadAllThingIDs returns a complete chronological list of all Thing IDs in the Thing table.
+func (s Service) ReadAllThingIDs(ctx context.Context) ([]string, error) {
+	return s.Table.ReadAllEntityIDs(ctx)
 }
 
 // ReadThingMessages returns a paginated list of Thing IDs and messages in the Thing table.

@@ -332,9 +332,27 @@ func TestReadAllVersionsAsJSON(t *testing.T) {
 	}
 }
 
+func TestCountThings(t *testing.T) {
+	expect := assert.New(t)
+	count, err := service.CountThings(ctx)
+	if expect.NoError(err) {
+		expect.Equal(int64(3), count)
+	}
+}
+
 func TestReadThingIDs(t *testing.T) {
 	expect := assert.New(t)
 	ids, err := service.ReadThingIDs(ctx, false, 10, "")
+	if expect.NoError(err) && expect.Equal(3, len(ids)) {
+		expect.Contains(ids, v10.ID)
+		expect.Contains(ids, v20.ID)
+		expect.Contains(ids, v30.ID)
+	}
+}
+
+func TestReadAllThingIDs(t *testing.T) {
+	expect := assert.New(t)
+	ids, err := service.ReadAllThingIDs(ctx)
 	if expect.NoError(err) && expect.Equal(3, len(ids)) {
 		expect.Contains(ids, v10.ID)
 		expect.Contains(ids, v20.ID)
