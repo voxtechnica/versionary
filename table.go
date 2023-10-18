@@ -50,11 +50,14 @@ type TableReader[T any] interface {
 	ReadAllPartKeyValues(ctx context.Context, row TableRow[T]) ([]string, error)
 	ReadAllSortKeyValues(ctx context.Context, row TableRow[T], partKeyValue string) ([]string, error)
 	ReadPartKeyValues(ctx context.Context, row TableRow[T], reverse bool, limit int, offset string) ([]string, error)
+	ReadPartKeyValueRange(ctx context.Context, row TableRow[T], from string, to string, reverse bool) ([]string, error)
 	ReadSortKeyValues(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]string, error)
+	ReadSortKeyValueRange(ctx context.Context, row TableRow[T], partKeyValue string, from string, to string, reverse bool) ([]string, error)
 	ReadFirstSortKeyValue(ctx context.Context, row TableRow[T], partKeyValue string) (string, error)
 	ReadLastSortKeyValue(ctx context.Context, row TableRow[T], partKeyValue string) (string, error)
 	ReadAllEntityIDs(ctx context.Context) ([]string, error)
 	ReadEntityIDs(ctx context.Context, reverse bool, limit int, offset string) ([]string, error)
+	ReadEntityIDRange(ctx context.Context, from string, to string, reverse bool) ([]string, error)
 	ReadAllEntityVersionIDs(ctx context.Context, entityID string) ([]string, error)
 	ReadEntityVersionIDs(ctx context.Context, entityID string, reverse bool, limit int, offset string) ([]string, error)
 	ReadCurrentEntityVersionID(ctx context.Context, entityID string) (string, error)
@@ -74,25 +77,32 @@ type TableReader[T any] interface {
 	ReadEntityFromRowAsCompressedJSON(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) ([]byte, error)
 	ReadEntitiesFromRow(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]T, error)
 	ReadEntitiesFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]byte, error)
+	ReadEntityRangeFromRow(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]T, error)
+	ReadEntityRangeFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]byte, error)
 	ReadAllEntitiesFromRow(ctx context.Context, row TableRow[T], partKeyValue string) ([]T, error)
 	ReadAllEntitiesFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string) ([]byte, error)
 	ReadRecord(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (Record, error)
 	ReadRecords(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]Record, error)
+	ReadRecordRange(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]Record, error)
 	ReadAllRecords(ctx context.Context, row TableRow[T], partKeyValue string) ([]Record, error)
 	ReadEntityLabel(ctx context.Context, entityID string) (TextValue, error)
 	ReadEntityLabels(ctx context.Context, reverse bool, limit int, offset string) ([]TextValue, error)
+	ReadEntityLabelRange(ctx context.Context, from, to string, reverse bool) ([]TextValue, error)
 	ReadAllEntityLabels(ctx context.Context, sortByValue bool) ([]TextValue, error)
 	FilterEntityLabels(ctx context.Context, f func(TextValue) bool) ([]TextValue, error)
 	ReadPartKeyLabel(ctx context.Context, row TableRow[T], partKeyValue string) (TextValue, error)
 	ReadPartKeyLabels(ctx context.Context, row TableRow[T], reverse bool, limit int, offset string) ([]TextValue, error)
+	ReadPartKeyLabelRange(ctx context.Context, row TableRow[T], from, to string, reverse bool) ([]TextValue, error)
 	ReadAllPartKeyLabels(ctx context.Context, row TableRow[T], sortByValue bool) ([]TextValue, error)
 	FilterPartKeyLabels(ctx context.Context, row TableRow[T], f func(TextValue) bool) ([]TextValue, error)
 	ReadTextValue(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (TextValue, error)
 	ReadTextValues(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]TextValue, error)
+	ReadTextValueRange(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]TextValue, error)
 	ReadAllTextValues(ctx context.Context, row TableRow[T], partKeyValue string, sortByValue bool) ([]TextValue, error)
 	FilterTextValues(ctx context.Context, row TableRow[T], partKeyValue string, f func(TextValue) bool) ([]TextValue, error)
 	ReadNumericValue(ctx context.Context, row TableRow[T], partKeyValue string, sortKeyValue string) (NumValue, error)
 	ReadNumericValues(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]NumValue, error)
+	ReadNumericValueRange(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]NumValue, error)
 	ReadAllNumericValues(ctx context.Context, row TableRow[T], partKeyValue string, sortByValue bool) ([]NumValue, error)
 }
 
@@ -177,17 +187,6 @@ func (row TableRow[T]) getDeletedPartKeyValues(oldVersion, newVersion T) []strin
 		return oldKeys
 	}
 	return Filter(oldKeys, func(key string) bool { return !Contains(newKeys, key) })
-}
-
-// getAddedPartKeyValues identifies partition key values that were added to the new version of an entity.
-// This helps us identify index keys that need to be added to "index" rows.
-func (row TableRow[T]) getAddedPartKeyValues(oldVersion, newVersion T) []string {
-	oldKeys := row.getPartKeyValues(oldVersion)
-	newKeys := row.getPartKeyValues(newVersion)
-	if (len(oldKeys) == 0) || (len(newKeys) == 0) {
-		return newKeys
-	}
-	return Filter(newKeys, func(key string) bool { return !Contains(oldKeys, key) })
 }
 
 // getWriteRecords generates a list of new Records for persisting the provided entity.
@@ -602,6 +601,9 @@ func (table Table[T]) EntityReferenceID(entity T) string {
 
 // EntityExists checks if an entity exists in the table.
 func (table Table[T]) EntityExists(ctx context.Context, entityID string) bool {
+	if entityID == "" {
+		return false
+	}
 	versionID, err := table.ReadFirstSortKeyValue(ctx, table.EntityRow, entityID)
 	return err == nil && versionID != ""
 }
@@ -877,6 +879,11 @@ func (table Table[T]) ReadPartKeyValues(ctx context.Context, row TableRow[T], re
 	return table.ReadSortKeyValues(ctx, row, "", reverse, limit, offset)
 }
 
+// ReadPartKeyValueRange reads a range of partition key values for the specified row.
+func (table Table[T]) ReadPartKeyValueRange(ctx context.Context, row TableRow[T], from string, to string, reverse bool) ([]string, error) {
+	return table.ReadSortKeyValueRange(ctx, row, "", from, to, reverse)
+}
+
 // CountSortKeyValues returns the total number of sort key values for the specified row and partition key value.
 // Note that this may be a slow operation; it pages through all the values to count them.
 func (table Table[T]) CountSortKeyValues(ctx context.Context, row TableRow[T], partKeyValue string) (int64, error) {
@@ -1010,6 +1017,72 @@ func (table Table[T]) ReadSortKeyValues(ctx context.Context, row TableRow[T], pa
 	return keyValues, nil
 }
 
+// ReadSortKeyValueRange reads a range of sort key values for the specified row and partition key value,
+// where the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table Table[T]) ReadSortKeyValueRange(ctx context.Context, row TableRow[T], partKeyValue string, from string, to string, reverse bool) ([]string, error) {
+	var partKey string
+	if partKeyValue == "" {
+		// Read partition key values
+		partKey = row.getRowPartKey()
+	} else {
+		// Read sort key values
+		partKey = row.getRowPartKeyValue(partKeyValue)
+	}
+	if from == "" {
+		if reverse {
+			from = "|" // after letters
+		} else {
+			from = "-" // before numbers
+		}
+	}
+	if to == "" {
+		if reverse {
+			to = "-" // before numbers
+		} else {
+			to = "|" // after letters
+		}
+	}
+	keyValues := make([]string, 0)
+	keyConditionExpression := "#p = :p and #s between :f and :t"
+	if from > to {
+		keyConditionExpression = "#p = :p and #s between :t and :f"
+	}
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: partKey},
+			":f": &types.AttributeValueMemberS{Value: from},
+			":t": &types.AttributeValueMemberS{Value: to},
+		},
+		KeyConditionExpression: aws.String(keyConditionExpression),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr()),
+		ScanIndexForward:       aws.Bool(!reverse),
+	}
+	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return keyValues, fmt.Errorf("failed reading sort key value range for row %s from table %s: %w", partKey, table.TableName, err)
+		}
+		for _, item := range page.Items {
+			if item == nil || item[table.getSortKeyAttr()] == nil {
+				continue
+			}
+			attrValue := item[table.getSortKeyAttr()]
+			keyValue := attrValue.(*types.AttributeValueMemberS).Value
+			if keyValue != "" {
+				keyValues = append(keyValues, keyValue)
+			}
+		}
+	}
+	return keyValues, nil
+}
+
 // ReadFirstSortKeyValue reads the first sort key value for the specified row and partition key value.
 // This method is typically used for looking up an ID corresponding to a foreign key.
 func (table Table[T]) ReadFirstSortKeyValue(ctx context.Context, row TableRow[T], partKeyValue string) (string, error) {
@@ -1087,6 +1160,13 @@ func (table Table[T]) ReadAllEntityIDs(ctx context.Context) ([]string, error) {
 // ReadEntityIDs reads paginated entity IDs from the EntityRow.
 func (table Table[T]) ReadEntityIDs(ctx context.Context, reverse bool, limit int, offset string) ([]string, error) {
 	return table.ReadPartKeyValues(ctx, table.EntityRow, reverse, limit, offset)
+}
+
+// ReadEntityIDRange reads a range of entity IDs from the EntityRow, where the entity IDs range
+// between the specified inclusive 'from' and 'to' values. If either 'from' or 'to' are empty,
+// they will be replaced with the appropriate sentinel value.
+func (table Table[T]) ReadEntityIDRange(ctx context.Context, from string, to string, reverse bool) ([]string, error) {
+	return table.ReadPartKeyValueRange(ctx, table.EntityRow, from, to, reverse)
 }
 
 // ReadAllEntityVersionIDs reads all entity version IDs for the specified entity.
@@ -1464,6 +1544,143 @@ func (table Table[T]) ReadEntitiesFromRowAsJSON(ctx context.Context, row TableRo
 	return buf.Bytes(), nil
 }
 
+// ReadEntityRangeFromRow reads a range of entities from the specified row, where
+// the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table Table[T]) ReadEntityRangeFromRow(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]T, error) {
+	entities := make([]T, 0)
+	if row.JsonValue == nil {
+		return entities, errors.New("row " + row.RowName + " must contain compressed JSON values")
+	}
+	if partKeyValue == "" {
+		return entities, nil
+	}
+	if from == "" {
+		if reverse {
+			from = "|" // after letters
+		} else {
+			from = "-" // before numbers
+		}
+	}
+	if to == "" {
+		if reverse {
+			to = "-" // before numbers
+		} else {
+			to = "|" // after letters
+		}
+	}
+	keyConditionExpression := "#p = :p and #s between :f and :t"
+	if from > to {
+		keyConditionExpression = "#p = :p and #s between :t and :f"
+	}
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
+			":f": &types.AttributeValueMemberS{Value: from},
+			":t": &types.AttributeValueMemberS{Value: to},
+		},
+		KeyConditionExpression: aws.String(keyConditionExpression),
+		ProjectionExpression:   aws.String(table.getJsonValueAttr()),
+		ScanIndexForward:       aws.Bool(!reverse),
+	}
+	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return entities, fmt.Errorf("error reading %s %s range: %w",
+				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
+		}
+		for _, item := range page.Items {
+			if item == nil || item[table.getJsonValueAttr()] == nil {
+				continue
+			}
+			gzJSON := item[table.getJsonValueAttr()].(*types.AttributeValueMemberB).Value
+			if entity, err := FromCompressedJSON[T](gzJSON); err == nil {
+				// best effort; skip entities with broken JSON
+				entities = append(entities, entity)
+			}
+		}
+	}
+	return entities, nil
+}
+
+// ReadEntityRangeFromRowAsJSON reads a range of entities from the specified row as JSON,
+// where the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table Table[T]) ReadEntityRangeFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]byte, error) {
+	if row.JsonValue == nil {
+		return nil, errors.New("row " + row.RowName + " must contain compressed JSON values")
+	}
+	if partKeyValue == "" {
+		return []byte("[]"), nil
+	}
+	if from == "" {
+		if reverse {
+			from = "|" // after letters
+		} else {
+			from = "-" // before numbers
+		}
+	}
+	if to == "" {
+		if reverse {
+			to = "-" // before numbers
+		} else {
+			to = "|" // after letters
+		}
+	}
+	keyConditionExpression := "#p = :p and #s between :f and :t"
+	if from > to {
+		keyConditionExpression = "#p = :p and #s between :t and :f"
+	}
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
+			":f": &types.AttributeValueMemberS{Value: from},
+			":t": &types.AttributeValueMemberS{Value: to},
+		},
+		KeyConditionExpression: aws.String(keyConditionExpression),
+		ProjectionExpression:   aws.String(table.getJsonValueAttr()),
+		ScanIndexForward:       aws.Bool(!reverse),
+	}
+	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
+	var comma bool
+	var buf bytes.Buffer
+	buf.WriteString("[")
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return []byte("[]"), fmt.Errorf("error reading JSON %s %s range: %w",
+				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
+		}
+		for _, item := range page.Items {
+			if item == nil || item[table.getJsonValueAttr()] == nil {
+				continue
+			}
+			gzJSON := item[table.getJsonValueAttr()].(*types.AttributeValueMemberB).Value
+			if jsonBytes, err := UncompressJSON(gzJSON); err == nil {
+				// best effort; skip entities with broken compressed JSON
+				if comma {
+					buf.WriteString(",")
+				}
+				buf.Write(jsonBytes)
+				comma = true
+			}
+		}
+	}
+	buf.WriteString("]")
+	return buf.Bytes(), nil
+}
+
 // ReadAllEntitiesFromRow reads all entities from the specified row.
 // Note: this could be a lot of data! It should only be used for small collections.
 func (table Table[T]) ReadAllEntitiesFromRow(ctx context.Context, row TableRow[T], partKeyValue string) ([]T, error) {
@@ -1628,6 +1845,64 @@ func (table Table[T]) ReadRecords(ctx context.Context, row TableRow[T], partKeyV
 	return records, nil
 }
 
+// ReadRecordRange reads a range of Records from the specified row, where the
+// sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table Table[T]) ReadRecordRange(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]Record, error) {
+	records := make([]Record, 0)
+	if partKeyValue == "" {
+		return records, nil
+	}
+	if from == "" {
+		if reverse {
+			from = "|" // after letters
+		} else {
+			from = "-" // before numbers
+		}
+	}
+	if to == "" {
+		if reverse {
+			to = "-" // before numbers
+		} else {
+			to = "|" // after letters
+		}
+	}
+	keyConditionExpression := "#p = :p and #s between :f and :t"
+	if from > to {
+		keyConditionExpression = "#p = :p and #s between :t and :f"
+	}
+	attributes := strings.Join(table.getAttributeNames(), ", ")
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
+			":f": &types.AttributeValueMemberS{Value: from},
+			":t": &types.AttributeValueMemberS{Value: to},
+		},
+		KeyConditionExpression: aws.String(keyConditionExpression),
+		ProjectionExpression:   aws.String(attributes),
+		ScanIndexForward:       aws.Bool(!reverse),
+	}
+	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return records, fmt.Errorf("error reading record %s %s range: %w",
+				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
+		}
+		for _, item := range page.Items {
+			if len(item) > 0 {
+				records = append(records, table.itemToRecord(item))
+			}
+		}
+	}
+	return records, nil
+}
+
 // ReadAllRecords reads all Records from the specified row.
 // Note: this can return a very large number of values! Use with caution.
 func (table Table[T]) ReadAllRecords(ctx context.Context, row TableRow[T], partKeyValue string) ([]Record, error) {
@@ -1672,6 +1947,13 @@ func (table Table[T]) ReadEntityLabel(ctx context.Context, entityID string) (Tex
 // ReadEntityLabels reads paginated entity labels.
 func (table Table[T]) ReadEntityLabels(ctx context.Context, reverse bool, limit int, offset string) ([]TextValue, error) {
 	return table.ReadPartKeyLabels(ctx, table.EntityRow, reverse, limit, offset)
+}
+
+// ReadEntityLabelRange reads a range of entity labels, where the entity IDs range between the
+// specified inclusive 'from' and 'to' values. If either 'from' or 'to' are empty, they will be
+// replaced with the appropriate sentinel value.
+func (table Table[T]) ReadEntityLabelRange(ctx context.Context, from, to string, reverse bool) ([]TextValue, error) {
+	return table.ReadPartKeyLabelRange(ctx, table.EntityRow, from, to, reverse)
 }
 
 // ReadAllEntityLabels reads all entity labels.
@@ -1762,6 +2044,67 @@ func (table Table[T]) ReadPartKeyLabels(ctx context.Context, row TableRow[T], re
 				tv.Value = item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
 			}
 			textValues = append(textValues, tv)
+		}
+	}
+	return textValues, nil
+}
+
+// ReadPartKeyLabelRange reads a range of partition key labels from the specified row,
+// where the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table Table[T]) ReadPartKeyLabelRange(ctx context.Context, row TableRow[T], from, to string, reverse bool) ([]TextValue, error) {
+	textValues := make([]TextValue, 0)
+	if row.PartKeyLabel == nil {
+		return textValues, errors.New("row " + row.RowName + " must contain partition key labels")
+	}
+	if from == "" {
+		if reverse {
+			from = "|" // after letters
+		} else {
+			from = "-" // before numbers
+		}
+	}
+	if to == "" {
+		if reverse {
+			to = "-" // before numbers
+		} else {
+			to = "|" // after letters
+		}
+	}
+	keyConditionExpression := "#p = :p and #s between :f and :t"
+	if from > to {
+		keyConditionExpression = "#p = :p and #s between :t and :f"
+	}
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: row.getRowPartKey()},
+			":f": &types.AttributeValueMemberS{Value: from},
+			":t": &types.AttributeValueMemberS{Value: to},
+		},
+		KeyConditionExpression: aws.String(keyConditionExpression),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr() + ", " + table.getTextValueAttr()),
+		ScanIndexForward:       aws.Bool(!reverse),
+	}
+	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return textValues, fmt.Errorf("error reading range partition key labels %s %s: %w",
+				table.EntityType, row.getRowPartKey(), err)
+		}
+		for _, item := range page.Items {
+			if item != nil && item[table.getSortKeyAttr()] != nil {
+				tv := TextValue{Key: item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value}
+				if item[table.getTextValueAttr()] != nil {
+					tv.Value = item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
+				}
+				textValues = append(textValues, tv)
+			}
 		}
 	}
 	return textValues, nil
@@ -1934,6 +2277,70 @@ func (table Table[T]) ReadTextValues(ctx context.Context, row TableRow[T], partK
 				tv.Value = item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
 			}
 			textValues = append(textValues, tv)
+		}
+	}
+	return textValues, nil
+}
+
+// ReadTextValueRange reads a range of text values from the specified row, where
+// the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table Table[T]) ReadTextValueRange(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]TextValue, error) {
+	textValues := make([]TextValue, 0)
+	if row.TextValue == nil {
+		return textValues, errors.New("row " + row.RowName + " must contain text values")
+	}
+	if partKeyValue == "" {
+		return textValues, nil
+	}
+	if from == "" {
+		if reverse {
+			from = "|" // after letters
+		} else {
+			from = "-" // before numbers
+		}
+	}
+	if to == "" {
+		if reverse {
+			to = "-" // before numbers
+		} else {
+			to = "|" // after letters
+		}
+	}
+	keyConditionExpression := "#p = :p and #s between :f and :t"
+	if from > to {
+		keyConditionExpression = "#p = :p and #s between :t and :f"
+	}
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
+			":f": &types.AttributeValueMemberS{Value: from},
+			":t": &types.AttributeValueMemberS{Value: to},
+		},
+		KeyConditionExpression: aws.String(keyConditionExpression),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr() + ", " + table.getTextValueAttr()),
+		ScanIndexForward:       aws.Bool(!reverse),
+	}
+	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return textValues, fmt.Errorf("error reading text value range %s %s: %w",
+				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
+		}
+		for _, item := range page.Items {
+			if item != nil && item[table.getSortKeyAttr()] != nil {
+				tv := TextValue{Key: item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value}
+				if item[table.getTextValueAttr()] != nil {
+					tv.Value = item[table.getTextValueAttr()].(*types.AttributeValueMemberS).Value
+				}
+				textValues = append(textValues, tv)
+			}
 		}
 	}
 	return textValues, nil
@@ -2112,6 +2519,70 @@ func (table Table[T]) ReadNumericValues(ctx context.Context, row TableRow[T], pa
 				nv.Value, _ = strconv.ParseFloat(item[table.getNumericValueAttr()].(*types.AttributeValueMemberN).Value, 64)
 			}
 			numValues = append(numValues, nv)
+		}
+	}
+	return numValues, nil
+}
+
+// ReadNumericValueRange reads a range of numeric values from the specified row, where
+// the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table Table[T]) ReadNumericValueRange(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]NumValue, error) {
+	numValues := make([]NumValue, 0)
+	if row.NumericValue == nil {
+		return numValues, errors.New("row " + row.RowName + " must contain numeric values")
+	}
+	if partKeyValue == "" {
+		return numValues, nil
+	}
+	if from == "" {
+		if reverse {
+			from = "|" // after letters
+		} else {
+			from = "-" // before numbers
+		}
+	}
+	if to == "" {
+		if reverse {
+			to = "-" // before numbers
+		} else {
+			to = "|" // after letters
+		}
+	}
+	keyConditionExpression := "#p = :p and #s between :f and :t"
+	if from > to {
+		keyConditionExpression = "#p = :p and #s between :t and :f"
+	}
+	req := dynamodb.QueryInput{
+		TableName: aws.String(table.TableName),
+		ExpressionAttributeNames: map[string]string{
+			"#p": table.getPartKeyAttr(),
+			"#s": table.getSortKeyAttr(),
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: row.getRowPartKeyValue(partKeyValue)},
+			":f": &types.AttributeValueMemberS{Value: from},
+			":t": &types.AttributeValueMemberS{Value: to},
+		},
+		KeyConditionExpression: aws.String(keyConditionExpression),
+		ProjectionExpression:   aws.String(table.getSortKeyAttr() + ", " + table.getNumericValueAttr()),
+		ScanIndexForward:       aws.Bool(!reverse),
+	}
+	paginator := dynamodb.NewQueryPaginator(table.Client, &req)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return numValues, fmt.Errorf("error reading numeric value range %s %s: %w",
+				table.EntityType, row.getRowPartKeyValue(partKeyValue), err)
+		}
+		for _, item := range page.Items {
+			if item != nil && item[table.getSortKeyAttr()] != nil {
+				nv := NumValue{Key: item[table.getSortKeyAttr()].(*types.AttributeValueMemberS).Value}
+				if item[table.getNumericValueAttr()] != nil {
+					nv.Value, _ = strconv.ParseFloat(item[table.getNumericValueAttr()].(*types.AttributeValueMemberN).Value, 64)
+				}
+				numValues = append(numValues, nv)
+			}
 		}
 	}
 	return numValues, nil

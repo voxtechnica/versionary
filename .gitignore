@@ -15,5 +15,6 @@
 # vendor/
 
 # IDEs
+.vscode
 .idea
 *.iml

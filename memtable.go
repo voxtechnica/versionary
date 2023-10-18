@@ -301,6 +301,13 @@ func (table MemTable[T]) ReadPartKeyValues(ctx context.Context, row TableRow[T],
 	return table.ReadSortKeyValues(ctx, row, "", reverse, limit, offset)
 }
 
+// ReadPartKeyValueRange reads a range of partition key values for the specified row,
+// where the partition key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table MemTable[T]) ReadPartKeyValueRange(ctx context.Context, row TableRow[T], from string, to string, reverse bool) ([]string, error) {
+	return table.ReadSortKeyValueRange(ctx, row, "", from, to, reverse)
+}
+
 // CountSortKeyValues counts the total number of sort key values for the specified row and partition key.
 func (table MemTable[T]) CountSortKeyValues(ctx context.Context, row TableRow[T], partKeyValue string) (int64, error) {
 	var partKey string
@@ -334,7 +341,10 @@ func (table MemTable[T]) ReadAllSortKeyValues(ctx context.Context, row TableRow[
 	return table.Records.GetSortKeys(partKey), nil
 }
 
-// ReadSortKeyValues reads paginated sort key values for the specified row and partition key value.
+// ReadSortKeyValues reads paginated sort key values for the specified row and partition key value,
+// where the sort key values are returned in ascending or descending order. The offset is the last
+// sort key value returned in the previous page of results. If the offset is empty, it will be
+// replaced with the appropriate sentinel value.
 func (table MemTable[T]) ReadSortKeyValues(ctx context.Context, row TableRow[T], partKeyValue string, reverse bool, limit int, offset string) ([]string, error) {
 	var partKey string
 	if partKeyValue == "" {
@@ -351,22 +361,73 @@ func (table MemTable[T]) ReadSortKeyValues(ctx context.Context, row TableRow[T],
 			offset = "-" // before numbers
 		}
 	}
-	allKeyValues := table.Records.GetSortKeys(partKey)
-	var keyValues []string
-	for i := 0; i < len(allKeyValues) && len(keyValues) < limit; i++ {
+	all := table.Records.GetSortKeys(partKey)
+	var values []string
+	for i := 0; i < len(all) && len(values) < limit; i++ {
 		if reverse {
-			keyValue := allKeyValues[len(allKeyValues)-i-1]
-			if keyValue < offset {
-				keyValues = append(keyValues, keyValue)
+			v := all[len(all)-i-1]
+			if v < offset {
+				values = append(values, v)
 			}
 		} else {
-			keyValue := allKeyValues[i]
-			if keyValue > offset {
-				keyValues = append(keyValues, keyValue)
+			v := all[i]
+			if v > offset {
+				values = append(values, v)
 			}
 		}
 	}
-	return keyValues, nil
+	return values, nil
+}
+
+// ReadSortKeyValueRange reads a range of sort key values for the specified row and partition key value,
+// where the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table MemTable[T]) ReadSortKeyValueRange(ctx context.Context, row TableRow[T], partKeyValue string, from string, to string, reverse bool) ([]string, error) {
+	var partKey string
+	if partKeyValue == "" {
+		// Read partition key values
+		partKey = row.getRowPartKey()
+	} else {
+		// Read sort key values
+		partKey = row.getRowPartKeyValue(partKeyValue)
+	}
+	// Set sentinel values, as applicable
+	if from == "" {
+		if reverse {
+			from = "|" // after letters
+		} else {
+			from = "-" // before numbers
+		}
+	}
+	if to == "" {
+		if reverse {
+			to = "-" // before numbers
+		} else {
+			to = "|" // after letters
+		}
+	}
+	// For the range test, 'from' must be less than 'to'
+	f := from
+	t := to
+	if from > to {
+		f = to
+		t = from
+	}
+	if table.Records == nil {
+		table.Records = &RecordSet{}
+	}
+	all := table.Records.GetSortKeys(partKey)
+	var values []string
+	for i := 0; i < len(all); i++ {
+		v := all[i]
+		if reverse {
+			v = all[len(all)-i-1]
+		}
+		if v >= f && v <= t {
+			values = append(values, v)
+		}
+	}
+	return values, nil
 }
 
 // ReadFirstSortKeyValue reads the first sort key value for the specified row and partition key value.
@@ -398,6 +459,13 @@ func (table MemTable[T]) ReadAllEntityIDs(ctx context.Context) ([]string, error)
 // ReadEntityIDs reads paginated entity IDs from the EntityRow.
 func (table MemTable[T]) ReadEntityIDs(ctx context.Context, reverse bool, limit int, offset string) ([]string, error) {
 	return table.ReadPartKeyValues(ctx, table.EntityRow, reverse, limit, offset)
+}
+
+// ReadEntityIDRange reads a range of entity IDs from the EntityRow,
+// where the entity IDs range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table MemTable[T]) ReadEntityIDRange(ctx context.Context, from string, to string, reverse bool) ([]string, error) {
+	return table.ReadPartKeyValueRange(ctx, table.EntityRow, from, to, reverse)
 }
 
 // ReadAllEntityVersionIDs reads all entity version IDs for the specified entity.
@@ -579,13 +647,6 @@ func (table MemTable[T]) ReadEntitiesFromRow(ctx context.Context, row TableRow[T
 	if partKeyValue == "" {
 		return entities, nil
 	}
-	if offset == "" {
-		if reverse {
-			offset = "|" // after letters
-		} else {
-			offset = "-" // before numbers
-		}
-	}
 	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, reverse, limit, offset)
 	if err != nil || len(sortKeyValues) == 0 {
 		return entities, nil
@@ -607,14 +668,61 @@ func (table MemTable[T]) ReadEntitiesFromRowAsJSON(ctx context.Context, row Tabl
 	if partKeyValue == "" {
 		return []byte("[]"), nil
 	}
-	if offset == "" {
-		if reverse {
-			offset = "|" // after letters
-		} else {
-			offset = "-" // before numbers
+	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, reverse, limit, offset)
+	if err != nil || len(sortKeyValues) == 0 {
+		return []byte("[]"), nil
+	}
+	var i int
+	var buf bytes.Buffer
+	buf.WriteString("[")
+	for _, sortKeyValue := range sortKeyValues {
+		if jsonBytes, err := table.ReadEntityFromRowAsJSON(ctx, row, partKeyValue, sortKeyValue); err == nil {
+			if i > 0 {
+				buf.WriteString(",")
+			}
+			buf.Write(jsonBytes)
+			i++
 		}
 	}
-	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, reverse, limit, offset)
+	buf.WriteString("]")
+	return buf.Bytes(), nil
+}
+
+// ReadEntityRangeFromRow reads a range of entities from the specified row, where
+// the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table MemTable[T]) ReadEntityRangeFromRow(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]T, error) {
+	entities := make([]T, 0)
+	if row.JsonValue == nil {
+		return entities, errors.New("row " + row.RowName + " must contain compressed JSON values")
+	}
+	if partKeyValue == "" {
+		return entities, nil
+	}
+	sortKeyValues, err := table.ReadSortKeyValueRange(ctx, row, partKeyValue, from, to, reverse)
+	if err != nil || len(sortKeyValues) == 0 {
+		return entities, nil
+	}
+	for _, sortKeyValue := range sortKeyValues {
+		if entity, err := table.ReadEntityFromRow(ctx, row, partKeyValue, sortKeyValue); err == nil {
+			// best effort; skip entities with broken JSON
+			entities = append(entities, entity)
+		}
+	}
+	return entities, nil
+}
+
+// ReadEntityRangeFromRowAsJSON reads a range of entities from the specified row as JSON,
+// where the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table MemTable[T]) ReadEntityRangeFromRowAsJSON(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]byte, error) {
+	if row.JsonValue == nil {
+		return nil, errors.New("row " + row.RowName + " must contain compressed JSON values")
+	}
+	if partKeyValue == "" {
+		return []byte("[]"), nil
+	}
+	sortKeyValues, err := table.ReadSortKeyValueRange(ctx, row, partKeyValue, from, to, reverse)
 	if err != nil || len(sortKeyValues) == 0 {
 		return []byte("[]"), nil
 	}
@@ -701,14 +809,21 @@ func (table MemTable[T]) ReadRecords(ctx context.Context, row TableRow[T], partK
 	if partKeyValue == "" {
 		return []Record{}, nil
 	}
-	if offset == "" {
-		if reverse {
-			offset = "|" // after letters
-		} else {
-			offset = "-" // before numbers
-		}
-	}
 	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, reverse, limit, offset)
+	if err != nil || len(sortKeyValues) == 0 {
+		return []Record{}, err
+	}
+	return table.Records.GetRecords(row.getRowPartKeyValue(partKeyValue), sortKeyValues), nil
+}
+
+// ReadRecordRange reads a range of Records from the specified row,
+// where the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table MemTable[T]) ReadRecordRange(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]Record, error) {
+	if partKeyValue == "" {
+		return []Record{}, nil
+	}
+	sortKeyValues, err := table.ReadSortKeyValueRange(ctx, row, partKeyValue, from, to, reverse)
 	if err != nil || len(sortKeyValues) == 0 {
 		return []Record{}, err
 	}
@@ -736,6 +851,13 @@ func (table MemTable[T]) ReadEntityLabel(ctx context.Context, entityID string) (
 // ReadEntityLabels reads paginated entity labels.
 func (table MemTable[T]) ReadEntityLabels(ctx context.Context, reverse bool, limit int, offset string) ([]TextValue, error) {
 	return table.ReadPartKeyLabels(ctx, table.EntityRow, reverse, limit, offset)
+}
+
+// ReadEntityLabelRange reads a range of entity labels,
+// where the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table MemTable[T]) ReadEntityLabelRange(ctx context.Context, from, to string, reverse bool) ([]TextValue, error) {
+	return table.ReadPartKeyLabelRange(ctx, table.EntityRow, from, to, reverse)
 }
 
 // ReadAllEntityLabels reads all entity labels.
@@ -773,14 +895,25 @@ func (table MemTable[T]) ReadPartKeyLabels(ctx context.Context, row TableRow[T],
 	if row.PartKeyLabel == nil {
 		return []TextValue{}, errors.New("row " + row.RowName + " must contain partition key labels")
 	}
-	if offset == "" {
-		if reverse {
-			offset = "|" // after letters
-		} else {
-			offset = "-" // before numbers
-		}
-	}
 	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, "", reverse, limit, offset)
+	if err != nil || len(sortKeyValues) == 0 {
+		return []TextValue{}, err
+	}
+	records := table.Records.GetRecords(row.getRowPartKey(), sortKeyValues)
+	textValues := Map(records, func(r Record) TextValue {
+		return TextValue{Key: r.SortKeyValue, Value: r.TextValue}
+	})
+	return textValues, nil
+}
+
+// ReadPartKeyLabelRange reads a range of partition key labels from the specified row,
+// where the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table MemTable[T]) ReadPartKeyLabelRange(ctx context.Context, row TableRow[T], from, to string, reverse bool) ([]TextValue, error) {
+	if row.PartKeyLabel == nil {
+		return []TextValue{}, errors.New("row " + row.RowName + " must contain partition key labels")
+	}
+	sortKeyValues, err := table.ReadSortKeyValueRange(ctx, row, "", from, to, reverse)
 	if err != nil || len(sortKeyValues) == 0 {
 		return []TextValue{}, err
 	}
@@ -860,14 +993,28 @@ func (table MemTable[T]) ReadTextValues(ctx context.Context, row TableRow[T], pa
 	if partKeyValue == "" {
 		return []TextValue{}, nil
 	}
-	if offset == "" {
-		if reverse {
-			offset = "|" // after letters
-		} else {
-			offset = "-" // before numbers
-		}
-	}
 	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, reverse, limit, offset)
+	if err != nil || len(sortKeyValues) == 0 {
+		return []TextValue{}, err
+	}
+	records := table.Records.GetRecords(row.getRowPartKeyValue(partKeyValue), sortKeyValues)
+	textValues := Map(records, func(r Record) TextValue {
+		return TextValue{Key: r.SortKeyValue, Value: r.TextValue}
+	})
+	return textValues, nil
+}
+
+// ReadTextValueRange reads a range of text values from the specified row,
+// where the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table MemTable[T]) ReadTextValueRange(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]TextValue, error) {
+	if row.TextValue == nil {
+		return []TextValue{}, errors.New("row " + row.RowName + " must contain text values")
+	}
+	if partKeyValue == "" {
+		return []TextValue{}, nil
+	}
+	sortKeyValues, err := table.ReadSortKeyValueRange(ctx, row, partKeyValue, from, to, reverse)
 	if err != nil || len(sortKeyValues) == 0 {
 		return []TextValue{}, err
 	}
@@ -953,14 +1100,28 @@ func (table MemTable[T]) ReadNumericValues(ctx context.Context, row TableRow[T],
 	if partKeyValue == "" {
 		return []NumValue{}, nil
 	}
-	if offset == "" {
-		if reverse {
-			offset = "|" // after letters
-		} else {
-			offset = "-" // before numbers
-		}
-	}
 	sortKeyValues, err := table.ReadSortKeyValues(ctx, row, partKeyValue, reverse, limit, offset)
+	if err != nil || len(sortKeyValues) == 0 {
+		return []NumValue{}, err
+	}
+	records := table.Records.GetRecords(row.getRowPartKeyValue(partKeyValue), sortKeyValues)
+	numValues := Map(records, func(r Record) NumValue {
+		return NumValue{Key: r.SortKeyValue, Value: r.NumericValue}
+	})
+	return numValues, nil
+}
+
+// ReadNumericValueRange reads a range of numeric values from the specified row,
+// where the sort key values range between the specified inclusive 'from' and 'to' values.
+// If either 'from' or 'to' are empty, they will be replaced with the appropriate sentinel value.
+func (table MemTable[T]) ReadNumericValueRange(ctx context.Context, row TableRow[T], partKeyValue string, from, to string, reverse bool) ([]NumValue, error) {
+	if row.NumericValue == nil {
+		return []NumValue{}, errors.New("row " + row.RowName + " must contain numeric values")
+	}
+	if partKeyValue == "" {
+		return []NumValue{}, nil
+	}
+	sortKeyValues, err := table.ReadSortKeyValueRange(ctx, row, partKeyValue, from, to, reverse)
 	if err != nil || len(sortKeyValues) == 0 {
 		return []NumValue{}, err
 	}
