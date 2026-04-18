@@ -1,5 +1,9 @@
 # Versionary
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/voxtechnica/versionary.svg)](https://pkg.go.dev/github.com/voxtechnica/versionary)
+[![Go Report Card](https://goreportcard.com/badge/github.com/voxtechnica/versionary)](https://goreportcard.com/report/github.com/voxtechnica/versionary)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Versionary provides an opinionated way of managing **versioned entities** in a NoSQL database, such as
 [AWS DynamoDB](https://aws.amazon.com/dynamodb/). It's a simple way of managing "wide rows", which
 provide really fast access to denormalized data, answering specific questions that one might have
@@ -48,3 +52,86 @@ workstation to use the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguid
 The integration test creates, exercises, and deletes a DynamoDB table. For testing in your applications,
 you can use the provided MemTable implementation, which is backed by a simple in-memory table, and
 supports the same TableReader, TableWriter, and TableReadWriter interfaces.
+
+## Quick Start
+
+The core of `versionary` revolves around defining your entities and how they map to DynamoDB wide rows using the `TableRow` configuration.
+
+Here is a brief example of how to configure a table for an entity called `Thing`.
+
+### 1. Define your Entity
+
+```go
+package example
+
+import (
+    "time"
+    v "github.com/voxtechnica/versionary"
+)
+
+type Thing struct {
+    ID        string    `json:"id"`
+    VersionID string    `json:"versionId"`
+    CreatedAt time.Time `json:"createdAt"`
+    Message   string    `json:"message"`
+}
+
+// CompressedJSON returns a compressed JSON representation of the Thing
+func (t Thing) CompressedJSON() []byte {
+    j, _ := v.ToCompressedJSON(t)
+    return j
+}
+```
+
+### 2. Configure the Table Rows
+
+Define `TableRow` specifications to indicate how the entity is partitioned and sorted:
+
+```go
+// The primary entity row stores all versions, partitioned by ID and ordered by VersionID
+var rowThingsVersion = v.TableRow[Thing]{
+    RowName:      "things_version",
+    PartKeyName:  "id",
+    PartKeyValue: func(t Thing) string { return t.ID },
+    SortKeyName:  "version_id",
+    SortKeyValue: func(t Thing) string { return t.VersionID },
+    JsonValue:    func(t Thing) []byte { return t.CompressedJSON() },
+}
+
+// Define your table configuration
+func NewTable(dbClient *dynamodb.Client, env string) v.Table[Thing] {
+    return v.Table[Thing]{
+        Client:     dbClient,
+        EntityType: "Thing",
+        TableName:  "things_" + env,
+        EntityRow:  rowThingsVersion,
+        IndexRows:  map[string]v.TableRow[Thing]{
+            // You can add more index rows here (e.g. partition by Date or Tags)
+        },
+    }
+}
+```
+
+### 3. Usage
+
+You can use the `Table` implementation to write and read from DynamoDB. For local testing without an AWS account, you can wrap it in a `MemTable`:
+
+```go
+// For local testing, use a MemTable
+memTable := v.NewMemTable(NewTable(nil, "test"))
+
+// Write an entity
+ctx := context.Background()
+thing := Thing{
+    ID:        "123",
+    VersionID: "123",
+    CreatedAt: time.Now(),
+    Message:   "Hello Versionary!",
+}
+err := memTable.WriteEntity(ctx, thing)
+
+// Read it back
+readThing, err := memTable.ReadEntity(ctx, "123")
+```
+
+For a comprehensive example showcasing multiple index rows, updates, and more, please see the `example` directory in this repository.
