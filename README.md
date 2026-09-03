@@ -101,16 +101,23 @@ var rowThingsVersion = v.TableRow[Thing]{
 // Define your table configuration
 func NewTable(dbClient *dynamodb.Client, env string) v.Table[Thing] {
     return v.Table[Thing]{
-        Client:     dbClient,
-        EntityType: "Thing",
-        TableName:  "things_" + env,
-        EntityRow:  rowThingsVersion,
-        IndexRows:  map[string]v.TableRow[Thing]{
+        Client:               dbClient,
+        EntityType:           "Thing",
+        TableName:            "things_" + env,
+        PointInTimeRecovery:  true,
+        RecoveryPeriodInDays: 14,
+        EntityRow:             rowThingsVersion,
+        IndexRows:             map[string]v.TableRow[Thing]{
             // You can add more index rows here (e.g. partition by Date or Tags)
         },
     }
 }
 ```
+
+`PointInTimeRecovery` is opt-in. When enabled, `CreateTable` configures PITR after
+the table becomes active. Since DynamoDB may report an active table before its
+continuous-backup subsystem is ready, Versionary retries that transient state.
+`RecoveryPeriodInDays` accepts 1–35; leave it at zero to use DynamoDB's default.
 
 ### 3. Usage
 
