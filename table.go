@@ -21,6 +21,8 @@ import (
 // ErrNotFound is returned when a specified thing is not found
 var ErrNotFound = errors.New("versionary: not found")
 
+const pointInTimeRecoveryRetryDelay = 3 * time.Second
+
 // TableWriter is the interface that defines methods for writing, updating, or deleting an entity from a DynamoDB table
 // based on an opinionated implementation of DynamoDB by Table.
 type TableWriter[T any] interface {
@@ -275,18 +277,20 @@ func (row TableRow[T]) getDeleteRecordsForKeys(partKeyValues []string, sortKeyVa
 // The EntityRow is special; it contains the revision history for the entity, whereas the IndexRows contain only
 // values from the latest revision of the entity.
 type Table[T any] struct {
-	Client           *dynamodb.Client       // AWS DynamoDB client
-	EntityType       string                 // the type of entity stored in this table
-	TableName        string                 // name of the table, typically including the entity type and environment name
-	PartKeyAttr      string                 // partition key attribute name (e.g. "v_part")
-	SortKeyAttr      string                 // sort key attribute name (e.g. "v_sort")
-	JsonValueAttr    string                 // JSON value attribute name (e.g. "v_json")
-	TextValueAttr    string                 // text value attribute name (e.g. "v_text")
-	NumericValueAttr string                 // numeric value attribute name (e.g. "v_num")
-	TimeToLiveAttr   string                 // time to live attribute name (e.g. "v_expires")
-	TTL              bool                   // true if the table has a time to live attribute
-	EntityRow        TableRow[T]            // the row that stores the entity versions
-	IndexRows        map[string]TableRow[T] // index rows, based on various entity properties
+	Client               *dynamodb.Client       // AWS DynamoDB client
+	EntityType           string                 // the type of entity stored in this table
+	TableName            string                 // name of the table, typically including the entity type and environment name
+	PartKeyAttr          string                 // partition key attribute name (e.g. "v_part")
+	SortKeyAttr          string                 // sort key attribute name (e.g. "v_sort")
+	JsonValueAttr        string                 // JSON value attribute name (e.g. "v_json")
+	TextValueAttr        string                 // text value attribute name (e.g. "v_text")
+	NumericValueAttr     string                 // numeric value attribute name (e.g. "v_num")
+	TimeToLiveAttr       string                 // time to live attribute name (e.g. "v_expires")
+	TTL                  bool                   // true if the table has a time to live attribute
+	PointInTimeRecovery  bool                   // true if point-in-time recovery should be enabled when creating the table
+	RecoveryPeriodInDays int32                  // optional PITR recovery period (1-35 days); zero uses the DynamoDB default
+	EntityRow            TableRow[T]            // the row that stores the entity versions
+	IndexRows            map[string]TableRow[T] // index rows, based on various entity properties
 }
 
 // IsValid returns true if the table fields and rows are valid.
@@ -530,6 +534,14 @@ func (table Table[T]) CreateTable(ctx context.Context) error {
 	t = describe.Table
 	log.Println("table", *t.TableName, t.TableStatus, time.Since(startTime))
 
+	// Enable point-in-time recovery after the table becomes active, if requested.
+	if table.PointInTimeRecovery {
+		err = table.UpdatePointInTimeRecovery(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Update the TTL on the table if requested
 	if table.TTL {
 		err = table.UpdateTTL(ctx)
@@ -538,6 +550,45 @@ func (table Table[T]) CreateTable(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// UpdatePointInTimeRecovery enables point-in-time recovery on the table.
+// DynamoDB may report an ACTIVE table before continuous backups are ready,
+// so this operation retries ContinuousBackupsUnavailableException responses.
+func (table Table[T]) UpdatePointInTimeRecovery(ctx context.Context) error {
+	return table.updatePointInTimeRecovery(ctx, pointInTimeRecoveryRetryDelay)
+}
+
+func (table Table[T]) updatePointInTimeRecovery(ctx context.Context, retryDelay time.Duration) error {
+	specification := &types.PointInTimeRecoverySpecification{
+		PointInTimeRecoveryEnabled: aws.Bool(true),
+	}
+	if table.RecoveryPeriodInDays != 0 {
+		specification.RecoveryPeriodInDays = aws.Int32(table.RecoveryPeriodInDays)
+	}
+	input := &dynamodb.UpdateContinuousBackupsInput{
+		TableName:                        aws.String(table.TableName),
+		PointInTimeRecoverySpecification: specification,
+	}
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		_, err := table.Client.UpdateContinuousBackups(ctx, input)
+		if err == nil {
+			log.Println("table", table.TableName, "PITR enabled")
+			return nil
+		}
+		var unavailable *types.ContinuousBackupsUnavailableException
+		if !errors.As(err, &unavailable) || time.Now().After(deadline) {
+			return fmt.Errorf("failed to enable point-in-time recovery on table %s: %w", table.TableName, err)
+		}
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // UpdateTTL updates the DynamoDB table's time-to-live settings.
